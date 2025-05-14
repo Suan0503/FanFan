@@ -400,11 +400,18 @@ def webhook():
 
         elif event_type == 'message':
             msg_type = event['message']['type']
-            if msg_type == 'text':
-                text = event['message']['text'].strip()
-            else:
+            if msg_type != 'text':
                 continue
+
+            text = event['message']['text'].strip()
             lower = text.lower()
+
+            # ✅ 新增：首次訊息自動跳出選單
+            if group_id not in data['user_prefs']:
+                data['user_prefs'][group_id] = set()
+                save_data()
+                reply(event['replyToken'], language_selection_message())
+                continue
 
             if '我的id' in lower:
                 reply(event['replyToken'], {
@@ -412,6 +419,8 @@ def webhook():
                     "text": f"🪪 你的 ID 是：{user_id}"
                 })
                 continue
+
+            # 🔽（下面原本你的判斷邏輯照舊保留...）
             if lower.startswith('/增加主人 id') and user_id in MASTER_USER_IDS:
                 parts = text.split()
                 if len(parts) == 3:
