@@ -734,7 +734,7 @@ def keep_alive():
             time.sleep(30)
             continue
 
-        time.sleep(300)  # 5分鐘檢查一次
+        time.sleep(900)  # 15分鐘檢查一次
 
 
 if __name__ == '__main__':
