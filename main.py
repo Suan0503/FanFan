@@ -353,6 +353,11 @@ def webhook():
             reply(event['replyToken'], language_selection_message())
             continue
 
+        # 處理加入群組事件
+        if event_type == 'join':
+            reply(event['replyToken'], language_selection_message())
+            continue
+
         if event_type == 'postback':
             data_post = event['postback']['data']
             if user_id not in MASTER_USER_IDS and user_id not in data[
@@ -734,7 +739,7 @@ def keep_alive():
             time.sleep(30)
             continue
 
-        time.sleep(900)  # 15分鐘檢查一次
+        time.sleep(300)  # 5分鐘檢查一次
 
 
 if __name__ == '__main__':
