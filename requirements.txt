@@ -1,0 +1,8 @@
+
+flask
+requests
+Pillow
+pytesseract
+line-bot-sdk
+Pillow
+psutil

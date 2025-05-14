@@ -1,0 +1,73 @@
+{
+  "user_whitelist": [],
+  "user_prefs": {
+    "Cc7dab222ed806d79d79d94b247d72646": [
+      "zh-TW",
+      "th"
+    ],
+    "Cf72280f89b2ea6b5494f018e1b1e0b68": [
+      "zh-TW",
+      "th"
+    ],
+    "C8d7a4c9b172146917d9869561c9c29ae": [
+      "zh-TW",
+      "th"
+    ],
+    "C5d480c670051b51d20fa5472e6f4c645": [
+      "zh-TW",
+      "th"
+    ],
+    "C1a496df7377a356df4421d9feff6fe92": [
+      "vi",
+      "zh-TW"
+    ],
+    "Ce61218121589f3ce4a0f44b9b58a26e6": [
+      "zh-TW",
+      "th"
+    ],
+    "C2de80d7bebdc5bb40afb1f64bcf27f96": [
+      "zh-TW",
+      "th"
+    ],
+    "C7fc52b698387ab0d9e2c340c862d8ec6": [
+      "vi",
+      "zh-TW"
+    ],
+    "Cde2a4aa945f5af1cd9b2c6ed59da0447": [
+      "zh-TW",
+      "th"
+    ],
+    "C729b4aa777388a3436234f6c89e6a2bb": [
+      "vi",
+      "zh-TW"
+    ],
+    "C91d352b1d1ab7945bc0645425f6df4ad": [
+      "vi",
+      "zh-TW"
+    ],
+    "C5e6988957128fce9b0a0d35c6621c5c7": [
+      "vi",
+      "zh-TW"
+    ],
+    "Cd28c4c6b9e80989be2973c774328dc92": [
+      "zh-TW",
+      "th"
+    ],
+    "C223aceec6284579ad04f06554d5a959e": [
+      "zh-TW",
+      "th"
+    ],
+    "C32f06690b35332f654319ed574b75c26": [
+      "zh-TW",
+      "th"
+    ],
+    "C4002a00dc0816629eaf3e77309559e10": [
+      "zh-TW",
+      "th"
+    ]
+  },
+  "voice_translation": {
+    "C5d480c670051b51d20fa5472e6f4c645": false,
+    "C1a496df7377a356df4421d9feff6fe92": false
+  }
+}
