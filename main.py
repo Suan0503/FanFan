@@ -729,7 +729,7 @@ def keep_alive():
             if current_time - last_restart >= restart_interval:
                 print("⏰ 執行定時重啟...")
                 save_data()
-                os._exit(0)
+                raise RuntimeError("⏰ 定時重啟觸發")
 
             response = requests.get('http://0.0.0.0:5000/', timeout=10)
             if response.status_code == 200:
