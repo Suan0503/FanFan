@@ -6,3 +6,4 @@ pytesseract
 line-bot-sdk
 Pillow
 psutil
+gunicorn
