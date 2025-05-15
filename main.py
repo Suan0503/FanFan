@@ -353,11 +353,6 @@ def webhook():
             reply(event['replyToken'], language_selection_message())
             continue
 
-        # 處理加入群組事件
-        if event_type == 'join':
-            reply(event['replyToken'], language_selection_message())
-            continue
-
         if event_type == 'postback':
             data_post = event['postback']['data']
             if user_id not in MASTER_USER_IDS and user_id not in data[
