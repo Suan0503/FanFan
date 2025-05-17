@@ -39,7 +39,12 @@ def save_master_users(master_set):
 MASTER_USER_IDS = load_master_users()
 
 # --- 資料儲存相關 ---
-data = {"user_whitelist": [], "user_prefs": {}, "voice_translation": {}}
+data = {
+    "user_whitelist": [],
+    "user_prefs": {},
+    "voice_translation": {},
+    "group_admin": {}  # 新增：儲存群組暫時管理員
+}
 
 start_time = time.time()
 translate_counter = 0
@@ -58,8 +63,8 @@ def load_data():
                         k: set(v) if isinstance(v, list) else v
                         for k, v in loaded_data.get("user_prefs", {}).items()
                     },
-                    "voice_translation":
-                    loaded_data.get("voice_translation", {})
+                    "voice_translation": loaded_data.get("voice_translation", {}),
+                    "group_admin": loaded_data.get("group_admin", {})  # 新增
                 }
                 print("✅ 成功讀取資料！")
             except Exception as e:
@@ -76,7 +81,8 @@ def save_data():
             k: list(v) if isinstance(v, set) else v
             for k, v in data["user_prefs"].items()
         },
-        "voice_translation": data["voice_translation"]
+        "voice_translation": data["voice_translation"],
+        "group_admin": data.get("group_admin", {})  # 新增
     }
     with open("data.json", "w", encoding="utf-8") as f:
         json.dump(save_data, f, ensure_ascii=False, indent=2)
@@ -106,10 +112,8 @@ def create_command_menu():
         "contents": {
             "type": "bubble",
             "header": {
-                "type":
-                "box",
-                "layout":
-                "vertical",
+                "type": "box",
+                "layout": "vertical",
                 "contents": [{
                     "type": "text",
                     "text": "⚡ 系統管理面板",
@@ -122,16 +126,12 @@ def create_command_menu():
                     "size": "sm",
                     "color": "#666666"
                 }],
-                "backgroundColor":
-                "#FFFFFF"
+                "backgroundColor": "#FFFFFF"
             },
             "body": {
-                "type":
-                "box",
-                "layout":
-                "vertical",
-                "spacing":
-                "md",
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
                 "contents": [{
                     "type": "button",
                     "style": "primary",
@@ -185,10 +185,8 @@ def create_command_menu():
                 }]
             },
             "footer": {
-                "type":
-                "box",
-                "layout":
-                "vertical",
+                "type": "box",
+                "layout": "vertical",
                 "contents": [{
                     "type": "text",
                     "text": "🔒 系統管理專用",
@@ -238,10 +236,8 @@ def language_selection_message():
         "contents": {
             "type": "bubble",
             "header": {
-                "type":
-                "box",
-                "layout":
-                "vertical",
+                "type": "box",
+                "layout": "vertical",
                 "contents": [{
                     "type": "text",
                     "text": "🌍 翻譯小精靈選單",
@@ -262,10 +258,8 @@ def language_selection_message():
                 "contents": contents
             },
             "footer": {
-                "type":
-                "box",
-                "layout":
-                "horizontal",
+                "type": "box",
+                "layout": "horizontal",
                 "contents": [{
                     "type": "text",
                     "text": "🏝️",
@@ -336,6 +330,10 @@ def reply(token, message_content):
     line_bot_api.reply_message(token, message)
 
 
+def is_group_admin(user_id, group_id):
+    return data.get('group_admin', {}).get(group_id) == user_id
+
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
     body = request.get_json()
@@ -350,18 +348,19 @@ def webhook():
 
         # 處理加入群組事件
         if event_type == 'join':
-            reply(event['replyToken'], language_selection_message())
-            continue
-
-        # 處理加入群組事件
-        if event_type == 'join':
+            inviter_id = user_id
+            if group_id and inviter_id:
+                data.setdefault('group_admin', {})
+                data['group_admin'][group_id] = inviter_id
+                save_data()
             reply(event['replyToken'], language_selection_message())
             continue
 
         if event_type == 'postback':
             data_post = event['postback']['data']
-            if user_id not in MASTER_USER_IDS and user_id not in data[
-                    'user_whitelist']:
+            if user_id not in MASTER_USER_IDS and \
+               user_id not in data['user_whitelist'] and \
+               not is_group_admin(user_id, group_id):
                 reply(event['replyToken'], {
                     "type": "text",
                     "text": "❌ 只有授權使用者可以更改翻譯設定喲～"
@@ -406,6 +405,7 @@ def webhook():
                 continue
             lower = text.lower()
 
+            # 只有主人可以用系統管理（指令權限不變）
             if '我的id' in lower:
                 reply(event['replyToken'], {
                     "type": "text",
@@ -462,7 +462,7 @@ def webhook():
 
             if lower in ['/選單', '/menu', 'menu']:
                 if user_id in MASTER_USER_IDS or user_id in data[
-                        'user_whitelist']:
+                        'user_whitelist'] or is_group_admin(user_id, group_id):
                     reply(event['replyToken'], language_selection_message())
                 else:
                     reply(event['replyToken'], {
@@ -532,7 +532,6 @@ def webhook():
                         "text": f"🔢 今日翻譯總字元數：{translate_char_counter} 個字元"
                     })
                 continue
-            # 圖片相關功能已移除
             if lower == '/統計':
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist']:
@@ -556,7 +555,7 @@ def webhook():
                 continue
             if lower in ['/選單', '選單', 'menu']:
                 if user_id in MASTER_USER_IDS or user_id in data[
-                        'user_whitelist']:
+                        'user_whitelist'] or is_group_admin(user_id, group_id):
                     reply(event['replyToken'], language_selection_message())
                 else:
                     reply(event['replyToken'], {
@@ -566,7 +565,7 @@ def webhook():
                 continue
             if lower == '語音翻譯':
                 if user_id in MASTER_USER_IDS or user_id in data[
-                        'user_whitelist']:
+                        'user_whitelist'] or is_group_admin(user_id, group_id):
                     current_status = data['voice_translation'].get(
                         group_id, True)
                     data['voice_translation'][group_id] = not current_status
@@ -585,7 +584,7 @@ def webhook():
 
             if lower == '自動翻譯':
                 if user_id in MASTER_USER_IDS or user_id in data[
-                        'user_whitelist']:
+                        'user_whitelist'] or is_group_admin(user_id, group_id):
                     if 'auto_translate' not in data:
                         data['auto_translate'] = {}
                     current_status = data['auto_translate'].get(group_id, True)
@@ -605,7 +604,7 @@ def webhook():
 
             if lower == '重設':
                 if user_id in MASTER_USER_IDS or user_id in data[
-                        'user_whitelist']:
+                        'user_whitelist'] or is_group_admin(user_id, group_id):
                     data['user_prefs'].pop(group_id, None)
                     save_data()
                     reply(event['replyToken'], {
@@ -654,9 +653,6 @@ def serve_image(filename):
 @app.route("/")
 def home():
     return "🎉 翻譯小精靈啟動成功 ✨"
-
-
-# 移除圖片相關功能
 
 
 def monitor_memory():
