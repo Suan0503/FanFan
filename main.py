@@ -6,8 +6,7 @@ import json
 import time
 import threading
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import TextSendMessage, ImageSendMessage
+from linebot.models import TextSendMessage
 
 app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
@@ -20,7 +19,6 @@ DEFAULT_MASTER_USER_IDS = {
     'Uea1646aa1a57861c85270d846aaee0eb', 'U8f3cc921a9dd18d3e257008a34dd07c1'
 }
 
-
 def load_master_users():
     if os.path.exists(MASTER_USER_FILE):
         with open(MASTER_USER_FILE, "r", encoding="utf-8") as f:
@@ -29,12 +27,10 @@ def load_master_users():
         save_master_users(DEFAULT_MASTER_USER_IDS)
         return DEFAULT_MASTER_USER_IDS.copy()
 
-
 def save_master_users(master_set):
     with open(MASTER_USER_FILE, "w", encoding="utf-8") as f:
         json.dump(list(master_set), f, ensure_ascii=False, indent=2)
         print("💾 主人列表已更新！")
-
 
 MASTER_USER_IDS = load_master_users()
 
@@ -49,7 +45,6 @@ data = {
 start_time = time.time()
 translate_counter = 0
 translate_char_counter = 0
-
 
 def load_data():
     global data
@@ -73,7 +68,6 @@ def load_data():
         print("🆕 沒找到資料，創建新的 data.json")
         save_data()
 
-
 def save_data():
     save_data = {
         "user_whitelist": data["user_whitelist"],
@@ -88,7 +82,6 @@ def save_data():
         json.dump(save_data, f, ensure_ascii=False, indent=2)
         print("💾 資料已儲存！")
 
-
 load_data()
 
 LANGUAGE_MAP = {
@@ -102,7 +95,6 @@ LANGUAGE_MAP = {
     '🇯🇵 日語': 'ja',
     '🇷🇺 俄羅斯': 'ru'
 }
-
 
 def create_command_menu():
     """創建指令選單"""
@@ -209,7 +201,6 @@ def create_command_menu():
         }
     }
 
-
 def language_selection_message():
     contents = [{
         "type": "button",
@@ -278,30 +269,6 @@ def language_selection_message():
         }
     }
 
-
-# 移除語音處理功能
-
-
-def process_image(image_path):
-    from PIL import Image
-    import pytesseract
-    try:
-        img = Image.open(image_path)
-        text = pytesseract.image_to_string(img)
-        return text.strip() or "無法識別圖片中的文字"
-    except:
-        return "圖片處理失敗"
-
-
-def suggest_languages(user_id):
-    user_history = data.get('translation_history', {}).get(user_id, [])
-    if not user_history:
-        return ['en']  # 默認英文
-    from collections import Counter
-    counts = Counter(lang for _, lang in user_history)
-    return [lang for lang, _ in counts.most_common(2)]
-
-
 def translate_text(text, target_lang):
     global translate_counter, translate_char_counter
     url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={text}"
@@ -312,7 +279,6 @@ def translate_text(text, target_lang):
         return res.json()[0][0][0]
     else:
         return "翻譯失敗QQ"
-
 
 def reply(token, message_content):
     if isinstance(message_content, dict):
@@ -329,10 +295,8 @@ def reply(token, message_content):
         ]
     line_bot_api.reply_message(token, message)
 
-
 def is_group_admin(user_id, group_id):
     return data.get('group_admin', {}).get(group_id) == user_id
-
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -346,16 +310,15 @@ def webhook():
             continue
         event_type = event.get("type")
 
-        # 處理加入群組事件
+        # --- 機器人被加進群組時公告 ---
         if event_type == 'join':
-            inviter_id = user_id
-            if group_id and inviter_id:
-                data.setdefault('group_admin', {})
-                data['group_admin'][group_id] = inviter_id
-                save_data()
-            reply(event['replyToken'], language_selection_message())
+            reply(event['replyToken'], {
+                "type": "text",
+                "text": "👋 歡迎加入！\n\n請本群第一位回覆「管理員認證」的人將成為本群的暫時管理員，可設定翻譯語言。"
+            })
             continue
 
+        # --- 處理 postback 設定語言 ---
         if event_type == 'postback':
             data_post = event['postback']['data']
             if user_id not in MASTER_USER_IDS and \
@@ -391,19 +354,80 @@ def webhook():
                     if code in data['user_prefs'][group_id]
                 ]
                 langs_str = '\n'.join(langs) if langs else '(無)'
-                reply_text = f"✅ 已更新翻譯語言！\n\n目前設定語言：\n{langs_str}"
                 reply(event['replyToken'], {
                     "type": "text",
-                    "text": f"目前設定語言：{langs}"
+                    "text": f"✅ 已更新翻譯語言！\n\n目前設定語言：\n{langs_str}"
                 })
 
         elif event_type == 'message':
             msg_type = event['message']['type']
-            if msg_type == 'text':
-                text = event['message']['text'].strip()
-            else:
+            if msg_type != 'text':
                 continue
+            text = event['message']['text'].strip()
             lower = text.lower()
+
+            # --- 認證暫時管理員 ---
+            if text == "管理員認證":
+                if group_id and group_id not in data.get('group_admin', {}):
+                    data.setdefault('group_admin', {})
+                    data['group_admin'][group_id] = user_id
+                    save_data()
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "✅ 已設為本群暫時管理員，可以設定翻譯語言！"
+                    })
+                else:
+                    if is_group_admin(user_id, group_id):
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "你已是本群的暫時管理員！"
+                        })
+                    else:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "本群已有暫時管理員，如需更換請聯絡主人。"
+                        })
+                continue
+
+            # --- 主人換管理員 ---
+            if (lower.startswith('/換管理員') or lower.startswith('換管理員')) and user_id in MASTER_USER_IDS:
+                parts = text.replace('　', ' ').split()
+                if len(parts) == 2:
+                    new_admin = parts[1]
+                    data.setdefault('group_admin', {})
+                    data['group_admin'][group_id] = new_admin
+                    save_data()
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": f"✅ 已將本群暫時管理員更換為 {new_admin[-5:]}"
+                    })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 格式錯誤，請使用 `/換管理員 [USER_ID]`"
+                    })
+                continue
+
+            # --- 查詢群組管理員 ---
+            if lower in ['/查群管理員', '查群管理員']:
+                admin_id = data.get('group_admin', {}).get(group_id)
+                if user_id in MASTER_USER_IDS or is_group_admin(user_id, group_id):
+                    if admin_id:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": f"本群暫時管理員為：{admin_id}"
+                        })
+                    else:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "本群尚未設定暫時管理員。"
+                        })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限查詢本群管理員喲～"
+                    })
+                continue
 
             # 只有主人可以用系統管理（指令權限不變）
             if '我的id' in lower:
@@ -641,19 +665,15 @@ def webhook():
                         "type": "text",
                         "text": '\n'.join(results)
                     })
-
     return 'OK'
-
 
 @app.route("/images/<path:filename>")
 def serve_image(filename):
     return send_from_directory('images', filename)
 
-
 @app.route("/")
 def home():
     return "🎉 翻譯小精靈啟動成功 ✨"
-
 
 def monitor_memory():
     """監控系統記憶體使用情況"""
@@ -665,42 +685,11 @@ def monitor_memory():
 
     # 強制進行垃圾回收
     gc.collect()
-
-    # 清理未使用的變數
     process.memory_percent()
 
     return memory_usage_mb
 
-
-def log_error(error_msg, exc_info=None):
-    """詳細的錯誤日誌記錄"""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    memory_usage = monitor_memory()
-    error_log = f"[{timestamp}] 錯誤: {error_msg}\n"
-    error_log += f"記憶體使用: {memory_usage:.2f} MB\n"
-    if exc_info:
-        import traceback
-        error_log += f"詳細錯誤:\n{traceback.format_exc()}\n"
-    print(error_log)
-    with open("error.log", "a", encoding="utf-8") as f:
-        f.write(error_log + "\n")
-
-
-def clean_files():
-    """清理系統檔案"""
-    # 清理錯誤日誌
-    if os.path.exists("error.log") and os.path.getsize("error.log") > 1024 * 1024:  # 1MB
-        with open("error.log", "w") as f:
-            f.write("")
-        print("🧹 已清理錯誤日誌")
-
-    # 清理圖片資料夾
-    if os.path.exists("images"):
-        for file in os.listdir("images"):
-            if time.time() - os.path.getctime(f"images/{file}") > 86400:  # 24小時
-                os.remove(f"images/{file}")
-
-import psutil  # 添加 psutil 導入
+import psutil
 
 def keep_alive():
     """每5分鐘檢查服務狀態"""
@@ -736,7 +725,6 @@ def keep_alive():
             continue
 
         time.sleep(300)  # 5分鐘檢查一次
-
 
 if __name__ == '__main__':
     max_retries = 3
