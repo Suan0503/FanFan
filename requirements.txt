@@ -7,3 +7,4 @@ line-bot-sdk
 Pillow
 psutil
 gunicorn
+python-dotenv
