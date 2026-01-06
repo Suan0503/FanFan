@@ -272,22 +272,13 @@ def language_selection_message():
 def translate_text(text, target_lang):
     global translate_counter, translate_char_counter
     url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={text}"
-    try:
-        # 設定請求逾時，避免卡住導致 Gunicorn worker timeout
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            translate_counter += 1
-            translate_char_counter += len(text)
-            return res.json()[0][0][0]
-        else:
-            print(f"translate_text status error: {res.status_code}")
-            return "翻譯失敗QQ (狀態碼異常)"
-    except requests.exceptions.Timeout:
-        print("translate_text timeout")
-        return "翻譯逾時，請稍後再試"
-    except Exception as e:
-        print(f"translate_text error: {e}")
-        return "翻譯失敗QQ (系統錯誤)"
+    res = requests.get(url)
+    if res.status_code == 200:
+        translate_counter += 1
+        translate_char_counter += len(text)
+        return res.json()[0][0][0]
+    else:
+        return "翻譯失敗QQ"
 
 def reply(token, message_content):
     if isinstance(message_content, dict):
