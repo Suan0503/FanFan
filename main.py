@@ -5,10 +5,24 @@ import requests
 import json
 import time
 import threading
+from datetime import datetime
+from flask_sqlalchemy import SQLAlchemy
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextSendMessage
 
 app = Flask(__name__)
+
+# 資料庫設定（參考 web 專案的 DATABASE_URL）
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+db = None
+if DATABASE_URL:
+    app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    db = SQLAlchemy(app)
+
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
 
@@ -84,16 +98,137 @@ def save_data():
 
 load_data()
 
+
+# --- 群組翻譯設定（資料庫 + 舊 data.json 並存） ---
+if db:
+    class GroupTranslateSetting(db.Model):  # type: ignore[misc]
+        """群組翻譯設定：每個群組選擇的目標語言清單。"""
+
+        __tablename__ = "group_translate_setting"
+
+        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+        group_id = db.Column(db.String(255), unique=True, nullable=False)
+        # 以逗號分隔的語言代碼，例如："en,zh-TW,ja"
+        languages = db.Column(db.String(255), nullable=False, default="en")
+        created_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               nullable=False)
+        updated_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               onupdate=datetime.utcnow,
+                               nullable=False)
+
+
+    with app.app_context():
+        db.create_all()
+else:
+    # 沒有設定資料庫時提供一個空的 placeholder 類別，避免型別檢查錯誤
+    class GroupTranslateSetting:  # type: ignore[misc]
+        pass
+
+
+def _load_group_langs_from_db(group_id):
+    """從資料庫取得群組語言設定（set），若沒有設定則回傳 None。"""
+
+    if not db or not group_id:
+        return None
+    try:
+        setting = GroupTranslateSetting.query.filter_by(
+            group_id=group_id).first()
+        if not setting or not setting.languages:
+            return None
+        langs = [c.strip() for c in setting.languages.split(',') if c.strip()]
+        return set(langs) if langs else None
+    except Exception:
+        return None
+
+
+def _save_group_langs_to_db(group_id, langs):
+    """儲存群組語言設定到資料庫，同時維持舊有 data.json 結構。"""
+
+    # 先更新記憶體與 data.json（舊機制仍保留，作為 fallback 與統計用）
+    if 'user_prefs' not in data:
+        data['user_prefs'] = {}
+    data['user_prefs'][group_id] = set(langs)
+    save_data()
+
+    if not db or not group_id:
+        return
+    try:
+        setting = GroupTranslateSetting.query.filter_by(
+            group_id=group_id).first()
+        if not setting:
+            setting = GroupTranslateSetting(group_id=group_id)
+            db.session.add(setting)
+        setting.languages = ','.join(sorted(langs)) if langs else ''
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def _delete_group_langs_from_db(group_id):
+    """刪除群組的資料庫設定（重設用）。"""
+
+    if 'user_prefs' in data:
+        data['user_prefs'].pop(group_id, None)
+        save_data()
+
+    if not db or not group_id:
+        return
+    try:
+        setting = GroupTranslateSetting.query.filter_by(
+            group_id=group_id).first()
+        if setting:
+            db.session.delete(setting)
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def get_group_langs(group_id):
+    """對外統一取得群組語言設定，優先使用資料庫，否則退回 data.json。"""
+
+    langs = _load_group_langs_from_db(group_id)
+    if langs is not None:
+        return langs
+    return data.get('user_prefs', {}).get(group_id, {'en'})
+
+
+def set_group_langs(group_id, langs):
+    """對外統一設定群組語言。"""
+
+    _save_group_langs_to_db(group_id, langs)
+
+
+def get_group_stats_for_status():
+    """給 /狀態 與 /統計 用的群組統計資訊。"""
+
+    if db:
+        try:
+            settings = GroupTranslateSetting.query.all()
+            lang_sets = []
+            for s in settings:
+                if s.languages:
+                    lang_sets.append(
+                        set([c.strip() for c in s.languages.split(',')
+                             if c.strip()]))
+            return lang_sets
+        except Exception:
+            pass
+
+    return list(data.get('user_prefs', {}).values())
+
+
 LANGUAGE_MAP = {
-    '🇹🇼 中文': 'zh-TW',
+    '🇹🇼 中文(台灣)': 'zh-TW',
     '🇺🇸 英文': 'en',
     '🇹🇭 泰文': 'th',
     '🇻🇳 越南文': 'vi',
     '🇲🇲 緬甸文': 'my',
     '🇰🇷 韓文': 'ko',
     '🇮🇩 印尼文': 'id',
-    '🇯🇵 日語': 'ja',
-    '🇷🇺 俄羅斯': 'ru'
+    '🇯🇵 日文': 'ja',
+    '🇷🇺 俄文': 'ru'
 }
 
 def create_command_menu():
@@ -201,17 +336,26 @@ def create_command_menu():
         }
     }
 
-def language_selection_message():
-    contents = [{
-        "type": "button",
-        "style": "primary",
-        "color": "#0099FF",
-        "action": {
-            "type": "postback",
-            "label": label,
-            "data": f"lang:{code}"
-        }
-    } for label, code in LANGUAGE_MAP.items()]
+def language_selection_message(group_id):
+    """群組翻譯語言選單，會依目前設定在按鈕前顯示 ✅。"""
+
+    current_langs = get_group_langs(group_id)
+
+    contents = []
+    for label, code in LANGUAGE_MAP.items():
+        selected = code in current_langs
+        button_label = f"✅ {label}" if selected else label
+        contents.append({
+            "type": "button",
+            "style": "primary",
+            "color": "#1DB446" if selected else "#0099FF",
+            "action": {
+                "type": "postback",
+                "label": button_label,
+                "data": f"lang:{code}"
+            }
+        })
+
     contents.append({
         "type": "button",
         "style": "secondary",
@@ -221,6 +365,7 @@ def language_selection_message():
             "data": "reset"
         }
     })
+
     return {
         "type": "flex",
         "altText": "🌍 請選擇翻譯語言",
@@ -231,15 +376,16 @@ def language_selection_message():
                 "layout": "vertical",
                 "contents": [{
                     "type": "text",
-                    "text": "🌍 翻譯小精靈選單",
+                    "text": "🌍 群組翻譯設定",
                     "weight": "bold",
                     "size": "lg",
                     "color": "#0099FF"
                 }, {
                     "type": "text",
-                    "text": "請選擇你要翻譯的語言 ✈️",
+                    "text": "請加上 / 取消要翻譯成的語言，可複選。",
                     "size": "sm",
-                    "color": "#555555"
+                    "color": "#555555",
+                    "wrap": True
                 }]
             },
             "body": {
@@ -253,9 +399,11 @@ def language_selection_message():
                 "layout": "horizontal",
                 "contents": [{
                     "type": "text",
-                    "text": "🏝️",
-                    "align": "end",
-                    "size": "lg"
+                    "text": "✅ 標記代表目前已啟用的翻譯語言。",
+                    "align": "start",
+                    "size": "xxs",
+                    "wrap": True,
+                    "color": "#666666"
                 }]
             },
             "styles": {
@@ -269,16 +417,94 @@ def language_selection_message():
         }
     }
 
-def translate_text(text, target_lang):
-    global translate_counter, translate_char_counter
-    url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={text}"
-    res = requests.get(url)
-    if res.status_code == 200:
-        translate_counter += 1
-        translate_char_counter += len(text)
+DEEPL_API_KEY = os.getenv('DEEPL_API_KEY', '')
+DEEPL_API_BASE_URL = os.getenv('DEEPL_API_BASE_URL', 'https://api-free.deepl.com')
+
+
+def _translate_with_deepl(text, target_lang):
+    """使用 DeepL API 翻譯，若語言不支援或錯誤則回傳 None。"""
+
+    if not DEEPL_API_KEY:
+        return None
+
+    # 將本服務語言代碼轉成 DeepL 語言代碼
+    deepl_lang_map = {
+        'en': 'EN',
+        'ja': 'JA',
+        'ru': 'RU',
+        'zh-TW': 'ZH-HANT',  # 傳統中文
+    }
+    deepl_target = deepl_lang_map.get(target_lang)
+    if not deepl_target:
+        return None
+
+    url = f"{DEEPL_API_BASE_URL.rstrip('/')}/v2/translate"
+    try:
+        resp = requests.post(
+            url,
+            data={
+                'auth_key': DEEPL_API_KEY,
+                'text': text,
+                'target_lang': deepl_target,
+            },
+            timeout=5,
+        )
+    except requests.RequestException:
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    try:
+        data_json = resp.json()
+        translations = data_json.get('translations') or []
+        if not translations:
+            return None
+        return translations[0].get('text')
+    except Exception:
+        return None
+
+
+def _translate_with_google(text, target_lang):
+    """使用 Google Translate 非官方 API，加入 timeout 與錯誤處理。"""
+
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        'client': 'gtx',
+        'sl': 'auto',
+        'tl': target_lang,
+        'dt': 't',
+        'q': text,
+    }
+    try:
+        res = requests.get(url, params=params, timeout=4)
+    except requests.RequestException:
+        return None
+
+    if res.status_code != 200:
+        return None
+
+    try:
         return res.json()[0][0][0]
-    else:
+    except Exception:
+        return None
+
+
+def translate_text(text, target_lang):
+    """統一翻譯入口：優先使用 DeepL，其次使用 Google。"""
+
+    global translate_counter, translate_char_counter
+
+    translated = _translate_with_deepl(text, target_lang)
+    if translated is None:
+        translated = _translate_with_google(text, target_lang)
+
+    if translated is None:
         return "翻譯失敗QQ"
+
+    translate_counter += 1
+    translate_char_counter += len(text)
+    return translated
 
 def reply(token, message_content):
     if isinstance(message_content, dict):
@@ -310,12 +536,15 @@ def webhook():
             continue
         event_type = event.get("type")
 
-        # --- 機器人被加進群組時公告 ---
+        # --- 機器人被加進群組時公告 + 自動跳出語言選單 ---
         if event_type == 'join':
-            reply(event['replyToken'], {
-                "type": "text",
-                "text": "👋 歡迎加入！\n\n請本群第一位回覆「管理員認證」的人將成為本群的暫時管理員，可設定翻譯語言。"
-            })
+            reply(event['replyToken'], [
+                {
+                    "type": "text",
+                    "text": "👋 歡迎邀請翻譯小精靈進入群組！\n\n請本群管理員或群主按下下面的「翻譯設定」，選擇要翻譯成哪些語言，之後群組內的訊息就會自動翻譯。"
+                },
+                language_selection_message(group_id)
+            ])
             continue
 
         # --- 處理 postback 設定語言 ---
@@ -330,28 +559,23 @@ def webhook():
                 })
                 continue
             if data_post == 'reset':
-                data['user_prefs'].pop(group_id, None)
-                save_data()
+                _delete_group_langs_from_db(group_id)
                 reply(event['replyToken'], {
                     "type": "text",
                     "text": "✅ 已清除翻譯語言設定！"
                 })
             elif data_post.startswith('lang:'):
                 code = data_post.split(':')[1]
-                if group_id not in data['user_prefs']:
-                    data['user_prefs'][group_id] = set()
-                if isinstance(data['user_prefs'][group_id], list):
-                    data['user_prefs'][group_id] = set(
-                        data['user_prefs'][group_id])
-                if code in data['user_prefs'][group_id]:
-                    data['user_prefs'][group_id].remove(code)
+                current_langs = get_group_langs(group_id)
+                if code in current_langs:
+                    current_langs.remove(code)
                 else:
-                    data['user_prefs'][group_id].add(code)
-                save_data()
+                    current_langs.add(code)
+                set_group_langs(group_id, current_langs)
                 langs = [
                     f"{label} ({code})"
                     for label, code in LANGUAGE_MAP.items()
-                    if code in data['user_prefs'][group_id]
+                    if code in get_group_langs(group_id)
                 ]
                 langs_str = '\n'.join(langs) if langs else '(無)'
                 reply(event['replyToken'], {
@@ -484,10 +708,11 @@ def webhook():
                     })
                 continue
 
-            if lower in ['/選單', '/menu', 'menu']:
+            # --- 語言選單（中文化，保留舊指令） ---
+            if lower in ['/選單', '/menu', 'menu', '翻譯選單', '/翻譯選單']:
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist'] or is_group_admin(user_id, group_id):
-                    reply(event['replyToken'], language_selection_message())
+                    reply(event['replyToken'], language_selection_message(group_id))
                 else:
                     reply(event['replyToken'], {
                         "type": "text",
@@ -538,15 +763,17 @@ def webhook():
                         "text": "❌ 只有主人可以重啟系統喲～"
                     })
                 continue
-            if lower == '/狀態':
+            if lower in ['/狀態', '系統狀態']:
                 uptime = time.time() - start_time
                 uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m"
+                lang_sets = get_group_stats_for_status()
+                group_count = len(lang_sets)
                 reply(
                     event['replyToken'], {
                         "type":
                         "text",
                         "text":
-                        f"⏰ 運行時間：{uptime_str}\n📚 翻譯次數：{translate_counter}\n🔠 累積字元：{translate_char_counter}\n👥 群組/用戶數量：{len(data['user_prefs'])}"
+                        f"⏰ 運行時間：{uptime_str}\n📚 翻譯次數：{translate_counter}\n🔠 累積字元：{translate_char_counter}\n👥 群組/用戶數量：{group_count}"
                     })
                 continue
             if lower == '/流量':
@@ -556,18 +783,17 @@ def webhook():
                         "text": f"🔢 今日翻譯總字元數：{translate_char_counter} 個字元"
                     })
                 continue
-            if lower == '/統計':
+            if lower in ['/統計', '翻譯統計']:
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist']:
-                    group_count = len(data['user_prefs'])
-                    total_langs = sum(
-                        len(langs) for langs in data['user_prefs'].values())
+                    lang_sets = get_group_stats_for_status()
+                    group_count = len(lang_sets)
+                    total_langs = sum(len(langs) for langs in lang_sets)
                     avg_langs = total_langs / group_count if group_count > 0 else 0
+                    all_langs = set(lang for langs in lang_sets for lang in langs)
                     most_used = max(
-                        set(lang for langs in data['user_prefs'].values()
-                            for lang in langs),
-                        key=lambda x: sum(1 for langs in data['user_prefs'].
-                                          values() if x in langs),
+                        all_langs,
+                        key=lambda x: sum(1 for langs in lang_sets if x in langs),
                         default="無")
                     stats = f"📊 群組統計\n\n👥 總群組數：{group_count}\n🌐 平均語言數：{avg_langs:.1f}\n⭐️ 最常用語言：{most_used}\n💬 總翻譯次數：{translate_counter}\n📝 總字元數：{translate_char_counter}"
                     reply(event['replyToken'], {"type": "text", "text": stats})
@@ -577,10 +803,10 @@ def webhook():
                         "text": "❌ 你沒有權限查看統計資料喲～"
                     })
                 continue
-            if lower in ['/選單', '選單', 'menu']:
+            if lower in ['/選單', '選單', 'menu', '翻譯選單', '/翻譯選單']:
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist'] or is_group_admin(user_id, group_id):
-                    reply(event['replyToken'], language_selection_message())
+                    reply(event['replyToken'], language_selection_message(group_id))
                 else:
                     reply(event['replyToken'], {
                         "type": "text",
@@ -626,11 +852,10 @@ def webhook():
                     })
                 continue
 
-            if lower == '重設':
+            if lower in ['重設', '重設翻譯設定']:
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist'] or is_group_admin(user_id, group_id):
-                    data['user_prefs'].pop(group_id, None)
-                    save_data()
+                    _delete_group_langs_from_db(group_id)
                     reply(event['replyToken'], {
                         "type": "text",
                         "text": "✅ 翻譯設定已重設！"
@@ -645,7 +870,7 @@ def webhook():
             # 檢查是否開啟自動翻譯
             auto_translate = data.get('auto_translate', {}).get(group_id, True)
             if auto_translate:
-                langs = data['user_prefs'].get(group_id, {'en'})
+                langs = get_group_langs(group_id)
                 results = [
                     f"[{lang}] {translate_text(text, lang)}" for lang in langs
                 ]
@@ -656,7 +881,7 @@ def webhook():
             elif text.startswith('!翻譯'):  # 手動翻譯指令
                 text_to_translate = text[3:].strip()
                 if text_to_translate:
-                    langs = data['user_prefs'].get(group_id, {'en'})
+                    langs = get_group_langs(group_id)
                     results = [
                         f"[{lang}] {translate_text(text_to_translate, lang)}"
                         for lang in langs
