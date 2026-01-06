@@ -9,8 +9,12 @@ from datetime import datetime, timedelta
 from flask_sqlalchemy import SQLAlchemy
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextSendMessage
+from dotenv import load_dotenv
 
 app = Flask(__name__)
+
+# 載入 .env 檔（若存在），讓本機開發也能讀到 DEEPL_API_KEY 等設定
+load_dotenv()
 
 # 資料庫設定（參考 web 專案的 DATABASE_URL）
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -571,6 +575,12 @@ def language_selection_message(group_id):
 DEEPL_API_KEY = os.getenv('DEEPL_API_KEY', '')
 DEEPL_API_BASE_URL = os.getenv('DEEPL_API_BASE_URL', 'https://api-free.deepl.com')
 
+if DEEPL_API_KEY:
+    # 只顯示前幾碼避免外洩完整金鑰
+    print(f"✅ DEEPL_API_KEY 已載入（開頭: {DEEPL_API_KEY[:6]}...）")
+else:
+    print("⚠️ 未設定 DEEPL_API_KEY，將只使用 Google 翻譯作為後備。")
+
 
 def _translate_with_deepl(text, target_lang):
     """使用 DeepL API 翻譯，若語言不支援或錯誤則回傳 None。"""
@@ -658,18 +668,43 @@ def translate_text(text, target_lang):
     return translated
 
 def reply(token, message_content):
+    from linebot.models import FlexSendMessage
+
+    # 單一訊息
     if isinstance(message_content, dict):
         if message_content.get("type") == "flex":
-            from linebot.models import FlexSendMessage
             message = FlexSendMessage(alt_text=message_content["altText"],
                                       contents=message_content["contents"])
         else:
-            message = TextSendMessage(text=message_content["text"])
+            message = TextSendMessage(text=message_content.get("text", ""))
+
+    # 多則訊息
     elif isinstance(message_content, list):
-        message = [
-            TextSendMessage(text=m["text"]) if m["type"] == "text" else m
-            for m in message_content
-        ]
+        converted = []
+        for m in message_content:
+            # 已經是 LINE Message 物件的，直接使用
+            if isinstance(m, (TextSendMessage, FlexSendMessage)):
+                converted.append(m)
+                continue
+
+            # dict 轉換為對應訊息物件
+            if isinstance(m, dict):
+                if m.get("type") == "flex":
+                    converted.append(
+                        FlexSendMessage(alt_text=m["altText"],
+                                        contents=m["contents"]))
+                else:
+                    converted.append(
+                        TextSendMessage(text=m.get("text", "")))
+            else:
+                # 其他型別（理論上不會用到），保留原樣以避免中斷
+                converted.append(m)
+
+        message = converted
+    else:
+        # fallback：當成純文字
+        message = TextSendMessage(text=str(message_content))
+
     line_bot_api.reply_message(token, message)
 
 def is_group_admin(user_id, group_id):
