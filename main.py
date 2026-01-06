@@ -689,17 +689,17 @@ def _format_translation_results(text, langs):
     return '\n'.join(results)
 
 
-def _async_translate_and_push(group_id, text, langs):
-    """在背景執行緒中翻譯並用 push_message 發送，避免阻塞 webhook。"""
+def _async_translate_and_reply(reply_token, text, langs):
+    """在背景執行緒中翻譯並用 reply_message 回覆，避免阻塞 webhook。"""
 
     try:
         # 為了避免 set 在其他地方被修改，先轉成 list
         lang_list = list(langs)
         result_text = _format_translation_results(text, lang_list)
-        line_bot_api.push_message(group_id,
-                                  TextSendMessage(text=result_text))
+        line_bot_api.reply_message(reply_token,
+                                   TextSendMessage(text=result_text))
     except Exception as e:
-        print(f"❌ 非同步翻譯推送失敗: {type(e).__name__}: {e}")
+        print(f"❌ 非同步翻譯回覆失敗: {type(e).__name__}: {e}")
 
 def reply(token, message_content):
     from linebot.models import FlexSendMessage
@@ -1107,17 +1107,12 @@ def webhook():
             if auto_translate:
                 langs = get_group_langs(group_id)
 
-                # 使用背景 thread + push_message，避免阻塞 LINE callback（避免 499）
+                # 使用背景 thread + reply_message，避免阻塞 LINE callback（避免 499），
+                # 同時不消耗 LINE 的 push 每月額度。
                 threading.Thread(
-                    target=_async_translate_and_push,
-                    args=(group_id, text, list(langs)),
+                    target=_async_translate_and_reply,
+                    args=(event['replyToken'], text, list(langs)),
                     daemon=True).start()
-
-                # 立即回覆一則簡短訊息，確保在 1 秒內完成 reply
-                reply(event['replyToken'], {
-                    "type": "text",
-                    "text": "⌛ 正在翻譯中，請稍候一小下～"
-                })
                 continue
             elif text.startswith('!翻譯'):  # 手動翻譯指令
                 text_to_translate = text[3:].strip()
@@ -1125,14 +1120,9 @@ def webhook():
                     langs = get_group_langs(group_id)
 
                     threading.Thread(
-                        target=_async_translate_and_push,
-                        args=(group_id, text_to_translate, list(langs)),
+                        target=_async_translate_and_reply,
+                        args=(event['replyToken'], text_to_translate, list(langs)),
                         daemon=True).start()
-
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "✅ 已收到翻譯指令，結果稍後會送出～"
-                    })
                     continue
     return 'OK'
 
