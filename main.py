@@ -97,7 +97,8 @@ def save_data():
             for k, v in data["user_prefs"].items()
         },
         "voice_translation": data["voice_translation"],
-        "group_admin": data.get("group_admin", {})  # 新增
+        "group_admin": data.get("group_admin", {}),  # 新增
+        "translate_engine_pref": data.get("translate_engine_pref", {})
     }
     with open("data.json", "w", encoding="utf-8") as f:
         json.dump(save_data, f, ensure_ascii=False, indent=2)
@@ -135,6 +136,22 @@ if db:
         last_active_at = db.Column(db.DateTime,
                                    default=datetime.utcnow,
                                    nullable=False)
+
+    class GroupEnginePreference(db.Model):  # type: ignore[misc]
+        """每個群組的翻譯引擎偏好（google / deepl）。"""
+
+        __tablename__ = "group_engine_preference"
+
+        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+        group_id = db.Column(db.String(255), unique=True, nullable=False)
+        engine = db.Column(db.String(20), nullable=False, default="google")
+        created_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               nullable=False)
+        updated_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               onupdate=datetime.utcnow,
+                               nullable=False)
 
 
     with app.app_context():
@@ -186,12 +203,44 @@ if db:
         except Exception as e:
             db.session.rollback()
             print(f"❌ 同步舊翻譯設定到資料庫失敗: {e}")
+
+        # 啟動時，將舊的 data.json 內 translate_engine_pref 同步到資料庫
+        try:
+            engine_prefs = data.get("translate_engine_pref", {})
+            migrated_engine_count = 0
+            for group_id, engine in engine_prefs.items():
+                if not group_id:
+                    continue
+                if engine not in ("google", "deepl"):
+                    continue
+
+                pref = GroupEnginePreference.query.filter_by(
+                    group_id=group_id).first()
+                if not pref:
+                    pref = GroupEnginePreference(group_id=group_id,
+                                                 engine=engine)
+                    db.session.add(pref)
+                    migrated_engine_count += 1
+                else:
+                    if pref.engine != engine:
+                        pref.engine = engine
+                        migrated_engine_count += 1
+
+            if migrated_engine_count:
+                db.session.commit()
+                print(f"✅ 已將 {migrated_engine_count} 組引擎偏好同步到資料庫")
+        except Exception as e:
+            db.session.rollback()
+            print(f"❌ 同步引擎偏好到資料庫失敗: {e}")
 else:
     # 沒有設定資料庫時提供一個空的 placeholder 類別，避免型別檢查錯誤
     class GroupTranslateSetting:  # type: ignore[misc]
         pass
 
     class GroupActivity:  # type: ignore[misc]
+        pass
+
+    class GroupEnginePreference:  # type: ignore[misc]
         pass
 
 
@@ -301,6 +350,52 @@ def touch_group_activity(group_id):
             db.session.add(activity)
         else:
             activity.last_active_at = now
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def get_engine_pref(group_id):
+    """取得群組翻譯引擎偏好（google / deepl），優先使用資料庫。"""
+
+    # 先看資料庫
+    if db and group_id:
+        try:
+            pref = GroupEnginePreference.query.filter_by(
+                group_id=group_id).first()
+            if pref and pref.engine in ("google", "deepl"):
+                return pref.engine
+        except Exception:
+            pass
+
+    # 退回 data.json 記憶體
+    engine = data.get("translate_engine_pref", {}).get(group_id)
+    if engine in ("google", "deepl"):
+        return engine
+    return "google"
+
+
+def set_engine_pref(group_id, engine):
+    """設定群組翻譯引擎偏好，寫入 data.json 與資料庫。"""
+
+    if engine not in ("google", "deepl"):
+        engine = "google"
+
+    data.setdefault("translate_engine_pref", {})
+    data["translate_engine_pref"][group_id] = engine
+    save_data()
+
+    if not db or not group_id:
+        return
+    try:
+        pref = GroupEnginePreference.query.filter_by(
+            group_id=group_id).first()
+        if not pref:
+            pref = GroupEnginePreference(group_id=group_id,
+                                         engine=engine)
+            db.session.add(pref)
+        else:
+            pref.engine = engine
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -646,23 +741,36 @@ def _translate_with_google(text, target_lang):
         'dt': 't',
         'q': text,
     }
-    try:
-        # 同樣縮短 timeout，避免阻塞
-        res = requests.get(url, params=params, timeout=2)
-    except requests.RequestException as e:
-        print(f"❌ Google 翻譯請求錯誤: {type(e).__name__}: {e}")
-        return None
+    # 增加 timeout 至 5 秒，並加上簡單重試機制
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = requests.get(url, params=params, timeout=5)
+        except requests.RequestException as e:
+            print(f"❌ Google 翻譯請求錯誤 (第 {attempt} 次): {type(e).__name__}: {e}")
+            if attempt == max_retries:
+                return None
+            time.sleep(0.3)
+            continue
 
-    if res.status_code != 200:
-        preview = res.text[:200] if hasattr(res, 'text') else ''
-        print(f"❌ Google 翻譯狀態碼 {res.status_code}，回應：{preview}")
-        return None
+        if res.status_code != 200:
+            preview = res.text[:200] if hasattr(res, 'text') else ''
+            print(f"❌ Google 翻譯狀態碼 {res.status_code} (第 {attempt} 次)，回應：{preview}")
+            if attempt == max_retries:
+                return None
+            time.sleep(0.3)
+            continue
 
-    try:
-        return res.json()[0][0][0]
-    except Exception as e:
-        print(f"❌ 解析 Google 翻譯回應失敗: {type(e).__name__}: {e}")
-        return None
+        try:
+            return res.json()[0][0][0]
+        except Exception as e:
+            print(f"❌ 解析 Google 翻譯回應失敗 (第 {attempt} 次): {type(e).__name__}: {e}")
+            if attempt == max_retries:
+                return None
+            time.sleep(0.3)
+            continue
+
+    return None
 
 
 def translate_text(text, target_lang, prefer_deepl_first=False):
@@ -830,9 +938,7 @@ def webhook():
             # --- 切換本群預設翻譯引擎為 DeepL 優先 ---
             # 預設為 Google -> DeepL，若輸入 "DEEPL" 則改為 DeepL -> Google
             if lower == 'deepl':
-                data.setdefault('translate_engine_pref', {})
-                data['translate_engine_pref'][group_id] = 'deepl'
-                save_data()
+                set_engine_pref(group_id, 'deepl')
                 reply(event['replyToken'], {
                     "type": "text",
                     "text": "✅ 本群預設翻譯引擎已改為：先 DeepL，再 Google（若 DeepL 失敗會自動改用 Google）。"
@@ -1132,8 +1238,7 @@ def webhook():
                 langs = get_group_langs(group_id)
 
                 # 依群組設定決定翻譯引擎先後順序（預設 Google 優先）
-                engine_pref = data.get('translate_engine_pref', {}).get(
-                    group_id, 'google')
+                engine_pref = get_engine_pref(group_id)
                 prefer_deepl_first = (engine_pref == 'deepl')
 
                 # 使用背景 thread + reply_message，避免阻塞 LINE callback（避免 499），
@@ -1149,8 +1254,7 @@ def webhook():
                 if text_to_translate:
                     langs = get_group_langs(group_id)
 
-                    engine_pref = data.get('translate_engine_pref', {}).get(
-                        group_id, 'google')
+                    engine_pref = get_engine_pref(group_id)
                     prefer_deepl_first = (engine_pref == 'deepl')
 
                     threading.Thread(
