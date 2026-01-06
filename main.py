@@ -5,7 +5,7 @@ import requests
 import json
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask_sqlalchemy import SQLAlchemy
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextSendMessage
@@ -118,6 +118,17 @@ if db:
                                onupdate=datetime.utcnow,
                                nullable=False)
 
+    class GroupActivity(db.Model):  # type: ignore[misc]
+        """紀錄群組最後活躍時間，用來判斷是否自動退出群組。"""
+
+        __tablename__ = "group_activity"
+
+        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+        group_id = db.Column(db.String(255), unique=True, nullable=False)
+        last_active_at = db.Column(db.DateTime,
+                                   default=datetime.utcnow,
+                                   nullable=False)
+
 
     with app.app_context():
         db.create_all()
@@ -126,6 +137,7 @@ if db:
         try:
             user_prefs = data.get("user_prefs", {})
             migrated_count = 0
+            activity_count = 0
             for group_id, langs in user_prefs.items():
                 if not group_id:
                     continue
@@ -151,15 +163,28 @@ if db:
                         setting.languages = lang_str
                         migrated_count += 1
 
-            if migrated_count:
+                # 確保已有翻譯設定的群組，同步建立 GroupActivity，
+                # 讓舊群組從「現在」開始重新計算 20 天未使用。
+                activity = GroupActivity.query.filter_by(
+                    group_id=group_id).first()
+                if not activity:
+                    activity = GroupActivity(group_id=group_id,
+                                             last_active_at=datetime.utcnow())
+                    db.session.add(activity)
+                    activity_count += 1
+
+            if migrated_count or activity_count:
                 db.session.commit()
-                print(f"✅ 已將 {migrated_count} 組舊翻譯設定同步到資料庫")
+                print(f"✅ 已將 {migrated_count} 組舊翻譯設定同步到資料庫，並為 {activity_count} 個群組建立活躍記錄")
         except Exception as e:
             db.session.rollback()
             print(f"❌ 同步舊翻譯設定到資料庫失敗: {e}")
 else:
     # 沒有設定資料庫時提供一個空的 placeholder 類別，避免型別檢查錯誤
     class GroupTranslateSetting:  # type: ignore[misc]
+        pass
+
+    class GroupActivity:  # type: ignore[misc]
         pass
 
 
@@ -253,6 +278,96 @@ def get_group_stats_for_status():
             pass
 
     return list(data.get('user_prefs', {}).values())
+
+
+def touch_group_activity(group_id):
+    """更新群組最後活躍時間（只在有資料庫時生效）。"""
+
+    if not db or not group_id:
+        return
+    try:
+        activity = GroupActivity.query.filter_by(group_id=group_id).first()
+        now = datetime.utcnow()
+        if not activity:
+            activity = GroupActivity(group_id=group_id,
+                                     last_active_at=now)
+            db.session.add(activity)
+        else:
+            activity.last_active_at = now
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def check_inactive_groups():
+    """檢查超過 20 天沒有任何活動的群組，自動退出群組。"""
+
+    if not db:
+        return
+
+    try:
+        threshold = datetime.utcnow() - timedelta(days=20)
+        inactive = GroupActivity.query.filter(
+            GroupActivity.last_active_at < threshold).all()
+    except Exception:
+        return
+
+    if not inactive:
+        return
+
+    for activity in inactive:
+        group_id = activity.group_id
+        try:
+            print(f"🚪 超過 20 天未使用，自動退出群組: {group_id}")
+            line_bot_api.leave_group(group_id)
+        except Exception as e:
+            print(f"❌ 退出群組 {group_id} 失敗: {e}")
+
+        # 清理記憶體中的資料
+        try:
+            if 'user_prefs' in data:
+                data['user_prefs'].pop(group_id, None)
+            if 'voice_translation' in data:
+                data['voice_translation'].pop(group_id, None)
+            if 'group_admin' in data:
+                data['group_admin'].pop(group_id, None)
+            if 'auto_translate' in data:
+                data['auto_translate'].pop(group_id, None)
+            save_data()
+        except Exception:
+            pass
+
+        # 清理資料庫中的設定
+        if not db:
+            continue
+        try:
+            setting = GroupTranslateSetting.query.filter_by(
+                group_id=group_id).first()
+            if setting:
+                db.session.delete(setting)
+            db.session.delete(activity)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+
+def start_inactive_checker():
+    """啟動背景執行緒，每天檢查一次未使用群組。"""
+
+    if not db:
+        return
+
+    def _loop():
+        while True:
+            try:
+                with app.app_context():
+                    check_inactive_groups()
+            except Exception as e:
+                print(f"❌ 檢查未使用群組時發生錯誤: {e}")
+            time.sleep(86400)  # 每天檢查一次
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
 
 
 LANGUAGE_MAP = {
@@ -571,6 +686,11 @@ def webhook():
         if not group_id or not user_id:
             continue
         event_type = event.get("type")
+
+        # 若是群組事件，更新最後活躍時間
+        raw_group_id = source.get("groupId")
+        if raw_group_id:
+            touch_group_activity(raw_group_id)
 
         # --- 機器人被加進群組時公告 + 自動跳出語言選單 ---
         if event_type == 'join':
@@ -1003,6 +1123,9 @@ if __name__ == '__main__':
 
     while True:
         try:
+            # 啟動自動檢查 20 天未使用群組的機制
+            start_inactive_checker()
+
             # 啟動Keep-Alive線程
             keep_alive_thread = threading.Thread(target=keep_alive,
                                                  daemon=True)
