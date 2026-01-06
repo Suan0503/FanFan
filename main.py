@@ -608,21 +608,27 @@ def _translate_with_deepl(text, target_lang):
                 'text': text,
                 'target_lang': deepl_target,
             },
-            timeout=5,
+            # 縮短 timeout，避免阻塞 LINE callback
+            timeout=2,
         )
-    except requests.RequestException:
+    except requests.RequestException as e:
+        print(f"❌ DeepL 請求錯誤: {type(e).__name__}: {e}")
         return None
 
     if resp.status_code != 200:
+        preview = resp.text[:200] if hasattr(resp, 'text') else ''
+        print(f"❌ DeepL 狀態碼 {resp.status_code}，回應：{preview}")
         return None
 
     try:
         data_json = resp.json()
         translations = data_json.get('translations') or []
         if not translations:
+            print("❌ DeepL 回傳內容沒有 translations 欄位")
             return None
         return translations[0].get('text')
-    except Exception:
+    except Exception as e:
+        print(f"❌ 解析 DeepL 回應失敗: {type(e).__name__}: {e}")
         return None
 
 
@@ -638,16 +644,21 @@ def _translate_with_google(text, target_lang):
         'q': text,
     }
     try:
-        res = requests.get(url, params=params, timeout=4)
-    except requests.RequestException:
+        # 同樣縮短 timeout，避免阻塞
+        res = requests.get(url, params=params, timeout=2)
+    except requests.RequestException as e:
+        print(f"❌ Google 翻譯請求錯誤: {type(e).__name__}: {e}")
         return None
 
     if res.status_code != 200:
+        preview = res.text[:200] if hasattr(res, 'text') else ''
+        print(f"❌ Google 翻譯狀態碼 {res.status_code}，回應：{preview}")
         return None
 
     try:
         return res.json()[0][0][0]
-    except Exception:
+    except Exception as e:
+        print(f"❌ 解析 Google 翻譯回應失敗: {type(e).__name__}: {e}")
         return None
 
 
@@ -666,6 +677,29 @@ def translate_text(text, target_lang):
     translate_counter += 1
     translate_char_counter += len(text)
     return translated
+
+
+def _format_translation_results(text, langs):
+    """將多語言翻譯結果組成一段文字。"""
+
+    results = []
+    for lang in langs:
+        translated = translate_text(text, lang)
+        results.append(f"[{lang}] {translated}")
+    return '\n'.join(results)
+
+
+def _async_translate_and_push(group_id, text, langs):
+    """在背景執行緒中翻譯並用 push_message 發送，避免阻塞 webhook。"""
+
+    try:
+        # 為了避免 set 在其他地方被修改，先轉成 list
+        lang_list = list(langs)
+        result_text = _format_translation_results(text, lang_list)
+        line_bot_api.push_message(group_id,
+                                  TextSendMessage(text=result_text))
+    except Exception as e:
+        print(f"❌ 非同步翻譯推送失敗: {type(e).__name__}: {e}")
 
 def reply(token, message_content):
     from linebot.models import FlexSendMessage
@@ -1072,25 +1106,34 @@ def webhook():
             auto_translate = data.get('auto_translate', {}).get(group_id, True)
             if auto_translate:
                 langs = get_group_langs(group_id)
-                results = [
-                    f"[{lang}] {translate_text(text, lang)}" for lang in langs
-                ]
+
+                # 使用背景 thread + push_message，避免阻塞 LINE callback（避免 499）
+                threading.Thread(
+                    target=_async_translate_and_push,
+                    args=(group_id, text, list(langs)),
+                    daemon=True).start()
+
+                # 立即回覆一則簡短訊息，確保在 1 秒內完成 reply
                 reply(event['replyToken'], {
                     "type": "text",
-                    "text": '\n'.join(results)
+                    "text": "⌛ 正在翻譯中，請稍候一小下～"
                 })
+                continue
             elif text.startswith('!翻譯'):  # 手動翻譯指令
                 text_to_translate = text[3:].strip()
                 if text_to_translate:
                     langs = get_group_langs(group_id)
-                    results = [
-                        f"[{lang}] {translate_text(text_to_translate, lang)}"
-                        for lang in langs
-                    ]
+
+                    threading.Thread(
+                        target=_async_translate_and_push,
+                        args=(group_id, text_to_translate, list(langs)),
+                        daemon=True).start()
+
                     reply(event['replyToken'], {
                         "type": "text",
-                        "text": '\n'.join(results)
+                        "text": "✅ 已收到翻譯指令，結果稍後會送出～"
                     })
+                    continue
     return 'OK'
 
 @app.route("/images/<path:filename>")
