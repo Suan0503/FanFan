@@ -121,6 +121,42 @@ if db:
 
     with app.app_context():
         db.create_all()
+
+        # 啟動時，嘗試將舊的 data.json 內 user_prefs 同步到資料庫
+        try:
+            user_prefs = data.get("user_prefs", {})
+            migrated_count = 0
+            for group_id, langs in user_prefs.items():
+                if not group_id:
+                    continue
+
+                # 統一轉成集合後再轉字串
+                if isinstance(langs, (list, set)):
+                    lang_set = {str(c).strip() for c in langs if c}
+                else:
+                    continue
+
+                lang_str = ",".join(sorted(lang_set))
+
+                setting = GroupTranslateSetting.query.filter_by(
+                    group_id=group_id).first()
+                if not setting:
+                    setting = GroupTranslateSetting(group_id=group_id,
+                                                   languages=lang_str)
+                    db.session.add(setting)
+                    migrated_count += 1
+                else:
+                    # 若資料庫本來就沒寫入 languages，補上一次即可
+                    if not setting.languages:
+                        setting.languages = lang_str
+                        migrated_count += 1
+
+            if migrated_count:
+                db.session.commit()
+                print(f"✅ 已將 {migrated_count} 組舊翻譯設定同步到資料庫")
+        except Exception as e:
+            db.session.rollback()
+            print(f"❌ 同步舊翻譯設定到資料庫失敗: {e}")
 else:
     # 沒有設定資料庫時提供一個空的 placeholder 類別，避免型別檢查錯誤
     class GroupTranslateSetting:  # type: ignore[misc]
@@ -710,9 +746,29 @@ def webhook():
 
             # --- 語言選單（中文化，保留舊指令） ---
             if lower in ['/選單', '/menu', 'menu', '翻譯選單', '/翻譯選單']:
-                if user_id in MASTER_USER_IDS or user_id in data[
-                        'user_whitelist'] or is_group_admin(user_id, group_id):
-                    reply(event['replyToken'], language_selection_message(group_id))
+                # 判斷是否已有暫時管理員
+                has_admin = data.get('group_admin', {}).get(group_id) is not None
+                is_privileged = user_id in MASTER_USER_IDS or user_id in data.get(
+                    'user_whitelist', []) or is_group_admin(user_id, group_id)
+
+                auto_set_admin_message = None
+
+                # 若尚未設定暫時管理員，第一個呼叫選單的人自動成為管理員
+                if not has_admin and not is_privileged:
+                    data.setdefault('group_admin', {})
+                    data['group_admin'][group_id] = user_id
+                    save_data()
+                    is_privileged = True
+                    auto_set_admin_message = "✅ 已自動將你設為本群的暫時管理員，可以設定翻譯語言！"
+
+                if is_privileged:
+                    if auto_set_admin_message:
+                        reply(event['replyToken'], [
+                            {"type": "text", "text": auto_set_admin_message},
+                            language_selection_message(group_id)
+                        ])
+                    else:
+                        reply(event['replyToken'], language_selection_message(group_id))
                 else:
                     reply(event['replyToken'], {
                         "type": "text",
@@ -801,16 +857,6 @@ def webhook():
                     reply(event['replyToken'], {
                         "type": "text",
                         "text": "❌ 你沒有權限查看統計資料喲～"
-                    })
-                continue
-            if lower in ['/選單', '選單', 'menu', '翻譯選單', '/翻譯選單']:
-                if user_id in MASTER_USER_IDS or user_id in data[
-                        'user_whitelist'] or is_group_admin(user_id, group_id):
-                    reply(event['replyToken'], language_selection_message(group_id))
-                else:
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 你沒有權限設定翻譯語言喲～"
                     })
                 continue
             if lower == '語音翻譯':

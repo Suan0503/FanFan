@@ -1,6 +1,7 @@
 
 flask
 Flask-SQLAlchemy
+psycopg2-binary
 requests
 Pillow
 pytesseract
