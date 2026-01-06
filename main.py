@@ -57,7 +57,9 @@ data = {
     "user_whitelist": [],
     "user_prefs": {},
     "voice_translation": {},
-    "group_admin": {}  # 新增：儲存群組暫時管理員
+    "group_admin": {},  # 新增：儲存群組暫時管理員
+    # 每個群組的翻譯引擎偏好："google" 或 "deepl"，預設為 google
+    "translate_engine_pref": {}
 }
 
 start_time = time.time()
@@ -77,7 +79,8 @@ def load_data():
                         for k, v in loaded_data.get("user_prefs", {}).items()
                     },
                     "voice_translation": loaded_data.get("voice_translation", {}),
-                    "group_admin": loaded_data.get("group_admin", {})  # 新增
+                    "group_admin": loaded_data.get("group_admin", {}),  # 新增
+                    "translate_engine_pref": loaded_data.get("translate_engine_pref", {})
                 }
                 print("✅ 成功讀取資料！")
             except Exception as e:
@@ -662,14 +665,23 @@ def _translate_with_google(text, target_lang):
         return None
 
 
-def translate_text(text, target_lang):
-    """統一翻譯入口：優先使用 DeepL，其次使用 Google。"""
+def translate_text(text, target_lang, prefer_deepl_first=False):
+    """統一翻譯入口：
+
+    - 預設先用 Google，再用 DeepL 當備援；
+    - 若 prefer_deepl_first=True，則先 DeepL，再 Google。
+    """
 
     global translate_counter, translate_char_counter
 
-    translated = _translate_with_deepl(text, target_lang)
+    if prefer_deepl_first:
+        first, second = _translate_with_deepl, _translate_with_google
+    else:
+        first, second = _translate_with_google, _translate_with_deepl
+
+    translated = first(text, target_lang)
     if translated is None:
-        translated = _translate_with_google(text, target_lang)
+        translated = second(text, target_lang)
 
     if translated is None:
         return "翻譯失敗QQ"
@@ -679,23 +691,23 @@ def translate_text(text, target_lang):
     return translated
 
 
-def _format_translation_results(text, langs):
+def _format_translation_results(text, langs, prefer_deepl_first=False):
     """將多語言翻譯結果組成一段文字。"""
 
     results = []
     for lang in langs:
-        translated = translate_text(text, lang)
+        translated = translate_text(text, lang, prefer_deepl_first=prefer_deepl_first)
         results.append(f"[{lang}] {translated}")
     return '\n'.join(results)
 
 
-def _async_translate_and_reply(reply_token, text, langs):
+def _async_translate_and_reply(reply_token, text, langs, prefer_deepl_first=False):
     """在背景執行緒中翻譯並用 reply_message 回覆，避免阻塞 webhook。"""
 
     try:
         # 為了避免 set 在其他地方被修改，先轉成 list
         lang_list = list(langs)
-        result_text = _format_translation_results(text, lang_list)
+        result_text = _format_translation_results(text, lang_list, prefer_deepl_first=prefer_deepl_first)
         line_bot_api.reply_message(reply_token,
                                    TextSendMessage(text=result_text))
     except Exception as e:
@@ -814,6 +826,18 @@ def webhook():
                 continue
             text = event['message']['text'].strip()
             lower = text.lower()
+
+            # --- 切換本群預設翻譯引擎為 DeepL 優先 ---
+            # 預設為 Google -> DeepL，若輸入 "DEEPL" 則改為 DeepL -> Google
+            if lower == 'deepl':
+                data.setdefault('translate_engine_pref', {})
+                data['translate_engine_pref'][group_id] = 'deepl'
+                save_data()
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": "✅ 本群預設翻譯引擎已改為：先 DeepL，再 Google（若 DeepL 失敗會自動改用 Google）。"
+                })
+                continue
 
             # --- 認證暫時管理員 ---
             if text == "管理員認證":
@@ -1107,11 +1131,17 @@ def webhook():
             if auto_translate:
                 langs = get_group_langs(group_id)
 
+                # 依群組設定決定翻譯引擎先後順序（預設 Google 優先）
+                engine_pref = data.get('translate_engine_pref', {}).get(
+                    group_id, 'google')
+                prefer_deepl_first = (engine_pref == 'deepl')
+
                 # 使用背景 thread + reply_message，避免阻塞 LINE callback（避免 499），
                 # 同時不消耗 LINE 的 push 每月額度。
                 threading.Thread(
                     target=_async_translate_and_reply,
-                    args=(event['replyToken'], text, list(langs)),
+                    args=(event['replyToken'], text, list(langs),
+                          prefer_deepl_first),
                     daemon=True).start()
                 continue
             elif text.startswith('!翻譯'):  # 手動翻譯指令
@@ -1119,9 +1149,14 @@ def webhook():
                 if text_to_translate:
                     langs = get_group_langs(group_id)
 
+                    engine_pref = data.get('translate_engine_pref', {}).get(
+                        group_id, 'google')
+                    prefer_deepl_first = (engine_pref == 'deepl')
+
                     threading.Thread(
                         target=_async_translate_and_reply,
-                        args=(event['replyToken'], text_to_translate, list(langs)),
+                        args=(event['replyToken'], text_to_translate,
+                              list(langs), prefer_deepl_first),
                         daemon=True).start()
                     continue
     return 'OK'
