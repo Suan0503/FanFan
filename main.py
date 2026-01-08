@@ -8,7 +8,7 @@ import threading
 from datetime import datetime, timedelta
 from flask_sqlalchemy import SQLAlchemy
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import TextSendMessage, MessageEvent, TextMessage, JoinEvent, PostbackEvent
+from linebot.models import TextSendMessage
 from dotenv import load_dotenv
 
 app = Flask(__name__)
@@ -110,7 +110,7 @@ load_data()
 # --- 群組翻譯設定（資料庫 + 舊 data.json 並存） ---
 if db:
     class GroupTranslateSetting(db.Model):  # type: ignore[misc]
-        """群組翻譯設定：包含語言清單、引擎偏好與最後活躍時間。"""
+        """群組翻譯設定：每個群組選擇的目標語言清單。"""
 
         __tablename__ = "group_translate_setting"
 
@@ -118,12 +118,33 @@ if db:
         group_id = db.Column(db.String(255), unique=True, nullable=False)
         # 以逗號分隔的語言代碼，例如："en,zh-TW,ja"
         languages = db.Column(db.String(255), nullable=False, default="en")
-        # 翻譯引擎偏好：google 或 deepl
-        engine = db.Column(db.String(20), nullable=False, default="google")
-        # 最後活躍時間（用於 20 天自動退群）
+        created_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               nullable=False)
+        updated_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               onupdate=datetime.utcnow,
+                               nullable=False)
+
+    class GroupActivity(db.Model):  # type: ignore[misc]
+        """紀錄群組最後活躍時間，用來判斷是否自動退出群組。"""
+
+        __tablename__ = "group_activity"
+
+        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+        group_id = db.Column(db.String(255), unique=True, nullable=False)
         last_active_at = db.Column(db.DateTime,
                                    default=datetime.utcnow,
                                    nullable=False)
+
+    class GroupEnginePreference(db.Model):  # type: ignore[misc]
+        """每個群組的翻譯引擎偏好（google / deepl）。"""
+
+        __tablename__ = "group_engine_preference"
+
+        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+        group_id = db.Column(db.String(255), unique=True, nullable=False)
+        engine = db.Column(db.String(20), nullable=False, default="google")
         created_at = db.Column(db.DateTime,
                                default=datetime.utcnow,
                                nullable=False)
@@ -136,12 +157,11 @@ if db:
     with app.app_context():
         db.create_all()
 
-        # 啟動時，同步 data.json 的所有設定到資料庫
+        # 啟動時，嘗試將舊的 data.json 內 user_prefs 同步到資料庫
         try:
             user_prefs = data.get("user_prefs", {})
-            engine_prefs = data.get("translate_engine_pref", {})
             migrated_count = 0
-            
+            activity_count = 0
             for group_id, langs in user_prefs.items():
                 if not group_id:
                     continue
@@ -153,38 +173,74 @@ if db:
                     continue
 
                 lang_str = ",".join(sorted(lang_set))
-                engine = engine_prefs.get(group_id, "google")
 
                 setting = GroupTranslateSetting.query.filter_by(
                     group_id=group_id).first()
                 if not setting:
-                    setting = GroupTranslateSetting(
-                        group_id=group_id,
-                        languages=lang_str,
-                        engine=engine,
-                        last_active_at=datetime.utcnow()
-                    )
+                    setting = GroupTranslateSetting(group_id=group_id,
+                                                   languages=lang_str)
                     db.session.add(setting)
                     migrated_count += 1
                 else:
-                    # 更新已存在的設定
+                    # 若資料庫本來就沒寫入 languages，補上一次即可
                     if not setting.languages:
                         setting.languages = lang_str
-                    if not hasattr(setting, 'engine') or not setting.engine:
-                        setting.engine = engine
-                    if not hasattr(setting, 'last_active_at') or not setting.last_active_at:
-                        setting.last_active_at = datetime.utcnow()
-                    migrated_count += 1
+                        migrated_count += 1
 
-            if migrated_count:
+                # 確保已有翻譯設定的群組，同步建立 GroupActivity，
+                # 讓舊群組從「現在」開始重新計算 20 天未使用。
+                activity = GroupActivity.query.filter_by(
+                    group_id=group_id).first()
+                if not activity:
+                    activity = GroupActivity(group_id=group_id,
+                                             last_active_at=datetime.utcnow())
+                    db.session.add(activity)
+                    activity_count += 1
+
+            if migrated_count or activity_count:
                 db.session.commit()
-                print(f"✅ 已將 {migrated_count} 組設定同步到資料庫")
+                print(f"✅ 已將 {migrated_count} 組舊翻譯設定同步到資料庫，並為 {activity_count} 個群組建立活躍記錄")
         except Exception as e:
             db.session.rollback()
-            print(f"❌ 同步設定到資料庫失敗: {e}")
+            print(f"❌ 同步舊翻譯設定到資料庫失敗: {e}")
+
+        # 啟動時，將舊的 data.json 內 translate_engine_pref 同步到資料庫
+        try:
+            engine_prefs = data.get("translate_engine_pref", {})
+            migrated_engine_count = 0
+            for group_id, engine in engine_prefs.items():
+                if not group_id:
+                    continue
+                if engine not in ("google", "deepl"):
+                    continue
+
+                pref = GroupEnginePreference.query.filter_by(
+                    group_id=group_id).first()
+                if not pref:
+                    pref = GroupEnginePreference(group_id=group_id,
+                                                 engine=engine)
+                    db.session.add(pref)
+                    migrated_engine_count += 1
+                else:
+                    if pref.engine != engine:
+                        pref.engine = engine
+                        migrated_engine_count += 1
+
+            if migrated_engine_count:
+                db.session.commit()
+                print(f"✅ 已將 {migrated_engine_count} 組引擎偏好同步到資料庫")
+        except Exception as e:
+            db.session.rollback()
+            print(f"❌ 同步引擎偏好到資料庫失敗: {e}")
 else:
     # 沒有設定資料庫時提供一個空的 placeholder 類別，避免型別檢查錯誤
     class GroupTranslateSetting:  # type: ignore[misc]
+        pass
+
+    class GroupActivity:  # type: ignore[misc]
+        pass
+
+    class GroupEnginePreference:  # type: ignore[misc]
         pass
 
 
@@ -286,16 +342,14 @@ def touch_group_activity(group_id):
     if not db or not group_id:
         return
     try:
-        setting = GroupTranslateSetting.query.filter_by(group_id=group_id).first()
+        activity = GroupActivity.query.filter_by(group_id=group_id).first()
         now = datetime.utcnow()
-        if not setting:
-            setting = GroupTranslateSetting(
-                group_id=group_id,
-                last_active_at=now
-            )
-            db.session.add(setting)
+        if not activity:
+            activity = GroupActivity(group_id=group_id,
+                                     last_active_at=now)
+            db.session.add(activity)
         else:
-            setting.last_active_at = now
+            activity.last_active_at = now
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -307,10 +361,10 @@ def get_engine_pref(group_id):
     # 先看資料庫
     if db and group_id:
         try:
-            setting = GroupTranslateSetting.query.filter_by(
+            pref = GroupEnginePreference.query.filter_by(
                 group_id=group_id).first()
-            if setting and setting.engine in ("google", "deepl"):
-                return setting.engine
+            if pref and pref.engine in ("google", "deepl"):
+                return pref.engine
         except Exception:
             pass
 
@@ -334,17 +388,14 @@ def set_engine_pref(group_id, engine):
     if not db or not group_id:
         return
     try:
-        setting = GroupTranslateSetting.query.filter_by(
+        pref = GroupEnginePreference.query.filter_by(
             group_id=group_id).first()
-        if not setting:
-            setting = GroupTranslateSetting(
-                group_id=group_id,
-                engine=engine,
-                last_active_at=datetime.utcnow()
-            )
-            db.session.add(setting)
+        if not pref:
+            pref = GroupEnginePreference(group_id=group_id,
+                                         engine=engine)
+            db.session.add(pref)
         else:
-            setting.engine = engine
+            pref.engine = engine
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -358,16 +409,16 @@ def check_inactive_groups():
 
     try:
         threshold = datetime.utcnow() - timedelta(days=20)
-        inactive = GroupTranslateSetting.query.filter(
-            GroupTranslateSetting.last_active_at < threshold).all()
+        inactive = GroupActivity.query.filter(
+            GroupActivity.last_active_at < threshold).all()
     except Exception:
         return
 
     if not inactive:
         return
 
-    for setting in inactive:
-        group_id = setting.group_id
+    for activity in inactive:
+        group_id = activity.group_id
         try:
             print(f"🚪 超過 20 天未使用，自動退出群組: {group_id}")
             line_bot_api.leave_group(group_id)
@@ -384,8 +435,6 @@ def check_inactive_groups():
                 data['group_admin'].pop(group_id, None)
             if 'auto_translate' in data:
                 data['auto_translate'].pop(group_id, None)
-            if 'translate_engine_pref' in data:
-                data['translate_engine_pref'].pop(group_id, None)
             save_data()
         except Exception:
             pass
@@ -394,7 +443,11 @@ def check_inactive_groups():
         if not db:
             continue
         try:
-            db.session.delete(setting)
+            setting = GroupTranslateSetting.query.filter_by(
+                group_id=group_id).first()
+            if setting:
+                db.session.delete(setting)
+            db.session.delete(activity)
             db.session.commit()
         except Exception:
             db.session.rollback()
@@ -813,446 +866,404 @@ def is_group_admin(user_id, group_id):
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    signature = request.headers['X-Line-Signature']
-    body = request.get_data(as_text=True)
-    
-    try:
-        handler.handle(body, signature)
-    except Exception as e:
-        print(f"❌ Webhook 處理錯誤: {e}")
-    
-    return 'OK'
-
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_text_message(event):
-    from linebot.models import MessageEvent, TextMessage
-    
-    # 模擬原本的 event 結構以保持向下兼容
-    class EventWrapper:
-        def __init__(self, line_event):
-            self._event = line_event
-            self.reply_token = line_event.reply_token
-            self.message = line_event.message
-            self.source = line_event.source
-            
-        def get(self, key, default=None):
-            return getattr(self._event, key, default)
-    
-    wrapped_event = EventWrapper(event)
-    
-    # 以下保持原有邏輯
-    for event in [wrapped_event]:
-        # 從 LINE event 取得基本資訊
-        source = event.source
-        group_id = getattr(source, 'group_id', None) or getattr(source, 'user_id', None)
-        user_id = getattr(source, 'user_id', None)
-        
+    body = request.get_json()
+    events = body.get("events", [])
+    for event in events:
+        source = event.get("source", {})
+        group_id = source.get("groupId") or source.get("userId")
+        user_id = source.get("userId")
         if not group_id or not user_id:
             continue
-            
+        event_type = event.get("type")
+
         # 若是群組事件，更新最後活躍時間
-        raw_group_id = getattr(source, 'group_id', None)
+        raw_group_id = source.get("groupId")
         if raw_group_id:
             touch_group_activity(raw_group_id)
 
-        # 處理文字訊息
-        msg_type = event.message.type
-        if msg_type != 'text':
-            return
-            
-        text = event.message.text.strip()
-        lower = text.lower()
-
-        # --- 切換本群預設翻譯引擎為 DeepL 優先 ---
-        # 預設為 Google -> DeepL，若輸入 "DEEPL" 則改為 DeepL -> Google
-        if lower == 'deepl':
-            set_engine_pref(group_id, 'deepl')
-            reply(event.reply_token, {
-                "type": "text",
-                "text": "✅ 本群預設翻譯引擎已改為：先 DeepL，再 Google（若 DeepL 失敗會自動改用 Google）。"
-            })
-            return
-
-        # --- 認證暫時管理員 ---
-        if text == "管理員認證":
-            if group_id and group_id not in data.get('group_admin', {}):
-                data.setdefault('group_admin', {})
-                data['group_admin'][group_id] = user_id
-                save_data()
-                reply(event.reply_token, {
+        # --- 機器人被加進群組時公告 + 自動跳出語言選單 ---
+        if event_type == 'join':
+            reply(event['replyToken'], [
+                {
                     "type": "text",
-                    "text": "✅ 已設為本群暫時管理員，可以設定翻譯語言！"
+                    "text": "👋 歡迎邀請翻譯小精靈進入群組！\n\n請本群管理員或群主按下下面的「翻譯設定」，選擇要翻譯成哪些語言，之後群組內的訊息就會自動翻譯。"
+                },
+                language_selection_message(group_id)
+            ])
+            continue
+
+        # --- 處理 postback 設定語言 ---
+        if event_type == 'postback':
+            data_post = event['postback']['data']
+            if user_id not in MASTER_USER_IDS and \
+               user_id not in data['user_whitelist'] and \
+               not is_group_admin(user_id, group_id):
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": "❌ 只有授權使用者可以更改翻譯設定喲～"
                 })
-            else:
-                if is_group_admin(user_id, group_id):
-                    reply(event.reply_token, {
+                continue
+            if data_post == 'reset':
+                _delete_group_langs_from_db(group_id)
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": "✅ 已清除翻譯語言設定！"
+                })
+            elif data_post.startswith('lang:'):
+                code = data_post.split(':')[1]
+                current_langs = get_group_langs(group_id)
+                if code in current_langs:
+                    current_langs.remove(code)
+                else:
+                    current_langs.add(code)
+                set_group_langs(group_id, current_langs)
+                langs = [
+                    f"{label} ({code})"
+                    for label, code in LANGUAGE_MAP.items()
+                    if code in get_group_langs(group_id)
+                ]
+                langs_str = '\n'.join(langs) if langs else '(無)'
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": f"✅ 已更新翻譯語言！\n\n目前設定語言：\n{langs_str}"
+                })
+
+        elif event_type == 'message':
+            msg_type = event['message']['type']
+            if msg_type != 'text':
+                continue
+            text = event['message']['text'].strip()
+            lower = text.lower()
+
+            # --- 切換本群預設翻譯引擎為 DeepL 優先 ---
+            # 預設為 Google -> DeepL，若輸入 "DEEPL" 則改為 DeepL -> Google
+            if lower == 'deepl':
+                set_engine_pref(group_id, 'deepl')
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": "✅ 本群預設翻譯引擎已改為：先 DeepL，再 Google（若 DeepL 失敗會自動改用 Google）。"
+                })
+                continue
+
+            # --- 認證暫時管理員 ---
+            if text == "管理員認證":
+                if group_id and group_id not in data.get('group_admin', {}):
+                    data.setdefault('group_admin', {})
+                    data['group_admin'][group_id] = user_id
+                    save_data()
+                    reply(event['replyToken'], {
                         "type": "text",
-                        "text": "你已是本群的暫時管理員！"
+                        "text": "✅ 已設為本群暫時管理員，可以設定翻譯語言！"
                     })
                 else:
-                    reply(event.reply_token, {
-                        "type": "text",
-                        "text": "本群已有暫時管理員，如需更換請聯絡主人。"
-                    })
-            return
+                    if is_group_admin(user_id, group_id):
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "你已是本群的暫時管理員！"
+                        })
+                    else:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "本群已有暫時管理員，如需更換請聯絡主人。"
+                        })
+                continue
 
-        # --- 主人換管理員 ---
-        if (lower.startswith('/換管理員') or lower.startswith('換管理員')) and user_id in MASTER_USER_IDS:
-            parts = text.replace('　', ' ').split()
-            if len(parts) == 2:
-                new_admin = parts[1]
-                data.setdefault('group_admin', {})
-                data['group_admin'][group_id] = new_admin
-                save_data()
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": f"✅ 已將本群暫時管理員更換為 {new_admin[-5:]}"
-                })
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 格式錯誤，請使用 `/換管理員 [USER_ID]`"
-                })
-            return
-
-        # --- 查詢群組管理員 ---
-        if lower in ['/查群管理員', '查群管理員']:
-            admin_id = data.get('group_admin', {}).get(group_id)
-            if user_id in MASTER_USER_IDS or is_group_admin(user_id, group_id):
-                if admin_id:
-                    reply(event.reply_token, {
+            # --- 主人換管理員 ---
+            if (lower.startswith('/換管理員') or lower.startswith('換管理員')) and user_id in MASTER_USER_IDS:
+                parts = text.replace('　', ' ').split()
+                if len(parts) == 2:
+                    new_admin = parts[1]
+                    data.setdefault('group_admin', {})
+                    data['group_admin'][group_id] = new_admin
+                    save_data()
+                    reply(event['replyToken'], {
                         "type": "text",
-                        "text": f"本群暫時管理員為：{admin_id}"
+                        "text": f"✅ 已將本群暫時管理員更換為 {new_admin[-5:]}"
                     })
                 else:
-                    reply(event.reply_token, {
+                    reply(event['replyToken'], {
                         "type": "text",
-                        "text": "本群尚未設定暫時管理員。"
+                        "text": "❌ 格式錯誤，請使用 `/換管理員 [USER_ID]`"
                     })
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 你沒有權限查詢本群管理員喲～"
-                })
-            return
+                continue
 
-        # 只有主人可以用系統管理（指令權限不變）
-        if '我的id' in lower:
-            reply(event.reply_token, {
-                "type": "text",
-                "text": f"🪪 你的 ID 是：{user_id}"
-            })
-            return
-            
-        if lower.startswith('/增加主人 id') and user_id in MASTER_USER_IDS:
-            parts = text.split()
-            if len(parts) == 3:
-                new_master = parts[2]
-                MASTER_USER_IDS.add(new_master)
-                save_master_users(MASTER_USER_IDS)
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": f"✅ 已新增新的主人：{new_master[-5:]}"
-                })
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 格式錯誤，請使用 `/增加主人 ID [UID]`"
-                })
-            return
-            
-        if lower == '/管理員列表':
-            if user_id in MASTER_USER_IDS or user_id in data['user_whitelist']:
-                masters = '\n'.join([f'👑 {uid[-5:]}' for uid in MASTER_USER_IDS])
-                whitelist = '\n'.join([f'👤 {uid[-5:]}' for uid in data['user_whitelist']]) if data['user_whitelist'] else '（無）'
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": f"📋 【主人列表】\n{masters}\n\n📋 【授權管理員】\n{whitelist}"
-                })
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 你沒有權限查看管理員列表喲～"
-                })
-            return
-            
-        if lower in ['/指令']:
-            if user_id in MASTER_USER_IDS or user_id in data['user_whitelist']:
-                reply(event.reply_token, create_command_menu())
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 你沒有權限查看管理選單喲～"
-                })
-            return
-
-        # --- 語言選單（中文化，保留舊指令） ---
-        if lower in ['/選單', '/menu', 'menu', '翻譯選單', '/翻譯選單']:
-            # 判斷是否已有暫時管理員
-            has_admin = data.get('group_admin', {}).get(group_id) is not None
-            is_privileged = user_id in MASTER_USER_IDS or user_id in data.get(
-                'user_whitelist', []) or is_group_admin(user_id, group_id)
-
-            auto_set_admin_message = None
-
-            # 若尚未設定暫時管理員，第一個呼叫選單的人自動成為管理員
-            if not has_admin and not is_privileged:
-                data.setdefault('group_admin', {})
-                data['group_admin'][group_id] = user_id
-                save_data()
-                is_privileged = True
-                auto_set_admin_message = "✅ 已自動將你設為本群的暫時管理員，可以設定翻譯語言！"
-
-            if is_privileged:
-                if auto_set_admin_message:
-                    reply(event.reply_token, [
-                        {"type": "text", "text": auto_set_admin_message},
-                        language_selection_message(group_id)
-                    ])
+            # --- 查詢群組管理員 ---
+            if lower in ['/查群管理員', '查群管理員']:
+                admin_id = data.get('group_admin', {}).get(group_id)
+                if user_id in MASTER_USER_IDS or is_group_admin(user_id, group_id):
+                    if admin_id:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": f"本群暫時管理員為：{admin_id}"
+                        })
+                    else:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "本群尚未設定暫時管理員。"
+                        })
                 else:
-                    reply(event.reply_token, language_selection_message(group_id))
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 你沒有權限設定翻譯語言喲～"
-                })
-            return
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限查詢本群管理員喲～"
+                    })
+                continue
 
-        if lower == '/記憶體':
-            if user_id in MASTER_USER_IDS:
-                memory_usage = monitor_memory()
-                reply(event.reply_token, {
+            # 只有主人可以用系統管理（指令權限不變）
+            if '我的id' in lower:
+                reply(event['replyToken'], {
                     "type": "text",
-                    "text": f"💾 系統記憶體使用狀況\n\n當前使用：{memory_usage:.2f} MB\n使用比例：{psutil.Process().memory_percent():.1f}%\n系統總計：{psutil.virtual_memory().total / (1024*1024):.0f} MB"
+                    "text": f"🪪 你的 ID 是：{user_id}"
                 })
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 只有主人可以查看記憶體使用狀況喲～"
-                })
-            return
+                continue
+            if lower.startswith('/增加主人 id') and user_id in MASTER_USER_IDS:
+                parts = text.split()
+                if len(parts) == 3:
+                    new_master = parts[2]
+                    MASTER_USER_IDS.add(new_master)
+                    save_master_users(MASTER_USER_IDS)
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": f"✅ 已新增新的主人：{new_master[-5:]}"
+                    })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 格式錯誤，請使用 `/增加主人 ID [UID]`"
+                    })
+                continue
+            if lower == '/管理員列表':
+                if user_id in MASTER_USER_IDS or user_id in data[
+                        'user_whitelist']:
+                    masters = '\n'.join(
+                        [f'👑 {uid[-5:]}' for uid in MASTER_USER_IDS])
+                    whitelist = '\n'.join([
+                        f'👤 {uid[-5:]}' for uid in data['user_whitelist']
+                    ]) if data['user_whitelist'] else '（無）'
+                    reply(
+                        event['replyToken'], {
+                            "type":
+                            "text",
+                            "text":
+                            f"📋 【主人列表】\n{masters}\n\n📋 【授權管理員】\n{whitelist}"
+                        })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限查看管理員列表喲～"
+                    })
+                continue
+            if lower in ['/指令']:
+                if user_id in MASTER_USER_IDS or user_id in data[
+                        'user_whitelist']:
+                    reply(event['replyToken'], create_command_menu())
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限查看管理選單喲～"
+                    })
+                continue
 
-        if lower in ['/重啟', '/restart', 'restart']:
-            if user_id in MASTER_USER_IDS:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "⚡ 系統即將重新啟動...\n請稍候約10秒鐘..."
-                })
-                print("🔄 執行手動重啟...")
-                time.sleep(1)
-                try:
-                    # 關閉 Flask server
-                    func = request.environ.get('werkzeug.server.shutdown')
-                    if func is not None:
-                        func()
-                    time.sleep(2)  # 等待port釋放
-                    os.execv(sys.executable, ['python'] + sys.argv)
-                except:
-                    os._exit(1)
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 只有主人可以重啟系統喲～"
-                })
-            return
-            
-        if lower in ['/狀態', '系統狀態']:
-            uptime = time.time() - start_time
-            uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m"
-            lang_sets = get_group_stats_for_status()
-            group_count = len(lang_sets)
-            reply(event.reply_token, {
-                "type": "text",
-                "text": f"⏰ 運行時間：{uptime_str}\n📚 翻譯次數：{translate_counter}\n🔠 累積字元：{translate_char_counter}\n👥 群組/用戶數量：{group_count}"
-            })
-            return
-            
-        if lower == '/流量':
-            reply(event.reply_token, {
-                "type": "text",
-                "text": f"🔢 今日翻譯總字元數：{translate_char_counter} 個字元"
-            })
-            return
-            
-        if lower in ['/統計', '翻譯統計']:
-            if user_id in MASTER_USER_IDS or user_id in data['user_whitelist']:
+            # --- 語言選單（中文化，保留舊指令） ---
+            if lower in ['/選單', '/menu', 'menu', '翻譯選單', '/翻譯選單']:
+                # 判斷是否已有暫時管理員
+                has_admin = data.get('group_admin', {}).get(group_id) is not None
+                is_privileged = user_id in MASTER_USER_IDS or user_id in data.get(
+                    'user_whitelist', []) or is_group_admin(user_id, group_id)
+
+                auto_set_admin_message = None
+
+                # 若尚未設定暫時管理員，第一個呼叫選單的人自動成為管理員
+                if not has_admin and not is_privileged:
+                    data.setdefault('group_admin', {})
+                    data['group_admin'][group_id] = user_id
+                    save_data()
+                    is_privileged = True
+                    auto_set_admin_message = "✅ 已自動將你設為本群的暫時管理員，可以設定翻譯語言！"
+
+                if is_privileged:
+                    if auto_set_admin_message:
+                        reply(event['replyToken'], [
+                            {"type": "text", "text": auto_set_admin_message},
+                            language_selection_message(group_id)
+                        ])
+                    else:
+                        reply(event['replyToken'], language_selection_message(group_id))
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限設定翻譯語言喲～"
+                    })
+                continue
+
+            if lower == '/記憶體':
+                if user_id in MASTER_USER_IDS:
+                    memory_usage = monitor_memory()
+                    reply(
+                        event['replyToken'], {
+                            "type":
+                            "text",
+                            "text":
+                            f"💾 系統記憶體使用狀況\n\n"
+                            f"當前使用：{memory_usage:.2f} MB\n"
+                            f"使用比例：{psutil.Process().memory_percent():.1f}%\n"
+                            f"系統總計：{psutil.virtual_memory().total / (1024*1024):.0f} MB"
+                        })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 只有主人可以查看記憶體使用狀況喲～"
+                    })
+                continue
+
+            if lower in ['/重啟', '/restart', 'restart']:
+                if user_id in MASTER_USER_IDS:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "⚡ 系統即將重新啟動...\n請稍候約10秒鐘..."
+                    })
+                    print("🔄 執行手動重啟...")
+                    time.sleep(1)
+                    try:
+                        # 關閉 Flask server
+                        func = request.environ.get('werkzeug.server.shutdown')
+                        if func is not None:
+                            func()
+                        time.sleep(2)  # 等待port釋放
+                        os.execv(sys.executable, ['python'] + sys.argv)
+                    except:
+                        os._exit(1)
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 只有主人可以重啟系統喲～"
+                    })
+                continue
+            if lower in ['/狀態', '系統狀態']:
+                uptime = time.time() - start_time
+                uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m"
                 lang_sets = get_group_stats_for_status()
                 group_count = len(lang_sets)
-                total_langs = sum(len(langs) for langs in lang_sets)
-                avg_langs = total_langs / group_count if group_count > 0 else 0
-                all_langs = set(lang for langs in lang_sets for lang in langs)
-                most_used = max(
-                    all_langs,
-                    key=lambda x: sum(1 for langs in lang_sets if x in langs),
+                reply(
+                    event['replyToken'], {
+                        "type":
+                        "text",
+                        "text":
+                        f"⏰ 運行時間：{uptime_str}\n📚 翻譯次數：{translate_counter}\n🔠 累積字元：{translate_char_counter}\n👥 群組/用戶數量：{group_count}"
+                    })
+                continue
+            if lower == '/流量':
+                reply(
+                    event['replyToken'], {
+                        "type": "text",
+                        "text": f"🔢 今日翻譯總字元數：{translate_char_counter} 個字元"
+                    })
+                continue
+            if lower in ['/統計', '翻譯統計']:
+                if user_id in MASTER_USER_IDS or user_id in data[
+                        'user_whitelist']:
+                    lang_sets = get_group_stats_for_status()
+                    group_count = len(lang_sets)
+                    total_langs = sum(len(langs) for langs in lang_sets)
+                    avg_langs = total_langs / group_count if group_count > 0 else 0
+                    all_langs = set(lang for langs in lang_sets for lang in langs)
+                    most_used = max(
+                        all_langs,
+                        key=lambda x: sum(1 for langs in lang_sets if x in langs),
                         default="無")
-                stats = f"📊 群組統計\n\n👥 總群組數：{group_count}\n🌐 平均語言數：{avg_langs:.1f}\n⭐️ 最常用語言：{most_used}\n💬 總翻譯次數：{translate_counter}\n📝 總字元數：{translate_char_counter}"
-                reply(event.reply_token, {"type": "text", "text": stats})
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 你沒有權限查看統計資料喲～"
-                })
-            return
-            
-        if lower == '語音翻譯':
-            if user_id in MASTER_USER_IDS or user_id in data['user_whitelist'] or is_group_admin(user_id, group_id):
-                current_status = data['voice_translation'].get(group_id, True)
-                data['voice_translation'][group_id] = not current_status
-                status_text = "開啟" if not current_status else "關閉"
-                save_data()
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": f"✅ 語音翻譯已{status_text}！"
-                })
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 你沒有權限設定語音翻譯喲～"
-                })
-            return
+                    stats = f"📊 群組統計\n\n👥 總群組數：{group_count}\n🌐 平均語言數：{avg_langs:.1f}\n⭐️ 最常用語言：{most_used}\n💬 總翻譯次數：{translate_counter}\n📝 總字元數：{translate_char_counter}"
+                    reply(event['replyToken'], {"type": "text", "text": stats})
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限查看統計資料喲～"
+                    })
+                continue
+            if lower == '語音翻譯':
+                if user_id in MASTER_USER_IDS or user_id in data[
+                        'user_whitelist'] or is_group_admin(user_id, group_id):
+                    current_status = data['voice_translation'].get(
+                        group_id, True)
+                    data['voice_translation'][group_id] = not current_status
+                    status_text = "開啟" if not current_status else "關閉"
+                    save_data()
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": f"✅ 語音翻譯已{status_text}！"
+                    })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限設定語音翻譯喲～"
+                    })
+                continue
 
-        if lower == '自動翻譯':
-            if user_id in MASTER_USER_IDS or user_id in data['user_whitelist'] or is_group_admin(user_id, group_id):
-                if 'auto_translate' not in data:
-                    data['auto_translate'] = {}
-                current_status = data['auto_translate'].get(group_id, True)
-                data['auto_translate'][group_id] = not current_status
-                status_text = "開啟" if not current_status else "關閉"
-                save_data()
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": f"✅ 自動翻譯已{status_text}！"
-                })
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 你沒有權限設定自動翻譯喲～"
-                })
-            return
+            if lower == '自動翻譯':
+                if user_id in MASTER_USER_IDS or user_id in data[
+                        'user_whitelist'] or is_group_admin(user_id, group_id):
+                    if 'auto_translate' not in data:
+                        data['auto_translate'] = {}
+                    current_status = data['auto_translate'].get(group_id, True)
+                    data['auto_translate'][group_id] = not current_status
+                    status_text = "開啟" if not current_status else "關閉"
+                    save_data()
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": f"✅ 自動翻譯已{status_text}！"
+                    })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限設定自動翻譯喲～"
+                    })
+                continue
 
-        if lower in ['重設', '重設翻譯設定']:
-            if user_id in MASTER_USER_IDS or user_id in data['user_whitelist'] or is_group_admin(user_id, group_id):
-                _delete_group_langs_from_db(group_id)
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "✅ 翻譯設定已重設！"
-                })
-            else:
-                reply(event.reply_token, {
-                    "type": "text",
-                    "text": "❌ 你沒有權限重設翻譯設定喲～"
-                })
-            return
+            if lower in ['重設', '重設翻譯設定']:
+                if user_id in MASTER_USER_IDS or user_id in data[
+                        'user_whitelist'] or is_group_admin(user_id, group_id):
+                    _delete_group_langs_from_db(group_id)
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "✅ 翻譯設定已重設！"
+                    })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 你沒有權限重設翻譯設定喲～"
+                    })
+                continue
 
             # 檢查是否開啟自動翻譯
             auto_translate = data.get('auto_translate', {}).get(group_id, True)
-        # 自動翻譯邏輯
-        if auto_translate:
-            langs = get_group_langs(group_id)
-
-            # 依群組設定決定翻譯引擎先後順序（預設 Google 優先）
-            engine_pref = get_engine_pref(group_id)
-            prefer_deepl_first = (engine_pref == 'deepl')
-
-            # 使用背景 thread + reply_message，避免阻塞 LINE callback（避免 499），
-            # 同時不消耗 LINE 的 push 每月額度。
-            threading.Thread(
-                target=_async_translate_and_reply,
-                args=(event.reply_token, text, list(langs),
-                      prefer_deepl_first),
-                daemon=True).start()
-            return
-        elif text.startswith('!翻譯'):  # 手動翻譯指令
-            text_to_translate = text[3:].strip()
-            if text_to_translate:
+            if auto_translate:
                 langs = get_group_langs(group_id)
 
+                # 依群組設定決定翻譯引擎先後順序（預設 Google 優先）
                 engine_pref = get_engine_pref(group_id)
                 prefer_deepl_first = (engine_pref == 'deepl')
 
+                # 使用背景 thread + reply_message，避免阻塞 LINE callback（避免 499），
+                # 同時不消耗 LINE 的 push 每月額度。
                 threading.Thread(
                     target=_async_translate_and_reply,
-                    args=(event.reply_token, text_to_translate,
-                          list(langs), prefer_deepl_first),
+                    args=(event['replyToken'], text, list(langs),
+                          prefer_deepl_first),
                     daemon=True).start()
-                return
+                continue
+            elif text.startswith('!翻譯'):  # 手動翻譯指令
+                text_to_translate = text[3:].strip()
+                if text_to_translate:
+                    langs = get_group_langs(group_id)
+
+                    engine_pref = get_engine_pref(group_id)
+                    prefer_deepl_first = (engine_pref == 'deepl')
+
+                    threading.Thread(
+                        target=_async_translate_and_reply,
+                        args=(event['replyToken'], text_to_translate,
+                              list(langs), prefer_deepl_first),
+                        daemon=True).start()
+                    continue
     return 'OK'
-
-
-@handler.add(JoinEvent)
-def handle_join(event):
-    """處理機器人被加進群組事件"""
-    from linebot.models import JoinEvent
-    
-    source = event.source
-    group_id = getattr(source, 'group_id', None) or getattr(source, 'user_id', None)
-    
-    if group_id:
-        touch_group_activity(group_id)
-        reply(event.reply_token, [
-            {
-                "type": "text",
-                "text": "👋 歡迎邀請翻譯小精靈進入群組！\n\n請本群管理員或群主按下下面的「翻譯設定」，選擇要翻譯成哪些語言，之後群組內的訊息就會自動翻譯。"
-            },
-            language_selection_message(group_id)
-        ])
-
-
-@handler.add(PostbackEvent)
-def handle_postback(event):
-    """處理 postback 設定語言"""
-    from linebot.models import PostbackEvent
-    
-    source = event.source
-    group_id = getattr(source, 'group_id', None) or getattr(source, 'user_id', None)
-    user_id = getattr(source, 'user_id', None)
-    
-    if not group_id or not user_id:
-        return
-        
-    # 更新活躍時間
-    raw_group_id = getattr(source, 'group_id', None)
-    if raw_group_id:
-        touch_group_activity(raw_group_id)
-    
-    data_post = event.postback.data
-    
-    # 權限檢查
-    if user_id not in MASTER_USER_IDS and \
-       user_id not in data['user_whitelist'] and \
-       not is_group_admin(user_id, group_id):
-        reply(event.reply_token, {
-            "type": "text",
-            "text": "❌ 只有授權使用者可以更改翻譯設定喲～"
-        })
-        return
-        
-    if data_post == 'reset':
-        _delete_group_langs_from_db(group_id)
-        reply(event.reply_token, {
-            "type": "text",
-            "text": "✅ 已清除翻譯語言設定！"
-        })
-    elif data_post.startswith('lang:'):
-        code = data_post.split(':')[1]
-        current_langs = get_group_langs(group_id)
-        if code in current_langs:
-            current_langs.remove(code)
-        else:
-            current_langs.add(code)
-        set_group_langs(group_id, current_langs)
-        langs = [
-            f"{label} ({code})"
-            for label, code in LANGUAGE_MAP.items()
-            if code in get_group_langs(group_id)
-        ]
-        langs_str = '\n'.join(langs) if langs else '(無)'
-        reply(event.reply_token, {
-            "type": "text",
-            "text": f"✅ 已更新翻譯語言！\n\n目前設定語言：\n{langs_str}"
-        })
-
 
 @app.route("/images/<path:filename>")
 def serve_image(filename):
