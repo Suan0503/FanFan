@@ -698,36 +698,53 @@ def _translate_with_deepl(text, target_lang):
         return None
 
     url = f"{DEEPL_API_BASE_URL.rstrip('/')}/v2/translate"
-    try:
-        resp = requests.post(
-            url,
-            data={
-                'auth_key': DEEPL_API_KEY,
-                'text': text,
-                'target_lang': deepl_target,
-            },
-            # 縮短 timeout，避免阻塞 LINE callback
-            timeout=2,
-        )
-    except requests.RequestException as e:
-        print(f"❌ DeepL 請求錯誤: {type(e).__name__}: {e}")
-        return None
+    
+    # 增加 timeout 至 5 秒，並加上重試機制與 exponential backoff
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                url,
+                data={
+                    'auth_key': DEEPL_API_KEY,
+                    'text': text,
+                    'target_lang': deepl_target,
+                },
+                timeout=5,
+            )
+        except requests.RequestException as e:
+            print(f"❌ DeepL 請求錯誤 (第 {attempt} 次): {type(e).__name__}: {e}")
+            if attempt == max_retries:
+                return None
+            time.sleep(0.5 * attempt)  # exponential backoff: 0.5s, 1s, 1.5s
+            continue
 
-    if resp.status_code != 200:
-        preview = resp.text[:200] if hasattr(resp, 'text') else ''
-        print(f"❌ DeepL 狀態碼 {resp.status_code}，回應：{preview}")
-        return None
+        if resp.status_code != 200:
+            preview = resp.text[:200] if hasattr(resp, 'text') else ''
+            print(f"❌ DeepL 狀態碼 {resp.status_code} (第 {attempt} 次)，回應：{preview}")
+            if attempt == max_retries:
+                return None
+            time.sleep(0.5 * attempt)
+            continue
 
-    try:
-        data_json = resp.json()
-        translations = data_json.get('translations') or []
-        if not translations:
-            print("❌ DeepL 回傳內容沒有 translations 欄位")
-            return None
-        return translations[0].get('text')
-    except Exception as e:
-        print(f"❌ 解析 DeepL 回應失敗: {type(e).__name__}: {e}")
-        return None
+        try:
+            data_json = resp.json()
+            translations = data_json.get('translations') or []
+            if not translations:
+                print(f"❌ DeepL 回傳內容沒有 translations 欄位 (第 {attempt} 次)")
+                if attempt == max_retries:
+                    return None
+                time.sleep(0.5 * attempt)
+                continue
+            return translations[0].get('text')
+        except Exception as e:
+            print(f"❌ 解析 DeepL 回應失敗 (第 {attempt} 次): {type(e).__name__}: {e}")
+            if attempt == max_retries:
+                return None
+            time.sleep(0.5 * attempt)
+            continue
+    
+    return None
 
 
 def _translate_with_google(text, target_lang):
@@ -741,7 +758,7 @@ def _translate_with_google(text, target_lang):
         'dt': 't',
         'q': text,
     }
-    # 增加 timeout 至 5 秒，並加上簡單重試機制
+    # 增加 timeout 至 5 秒，加上重試機制與 exponential backoff
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
@@ -750,7 +767,7 @@ def _translate_with_google(text, target_lang):
             print(f"❌ Google 翻譯請求錯誤 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.3)
+            time.sleep(0.5 * attempt)  # exponential backoff: 0.5s, 1s, 1.5s
             continue
 
         if res.status_code != 200:
@@ -758,7 +775,7 @@ def _translate_with_google(text, target_lang):
             print(f"❌ Google 翻譯狀態碼 {res.status_code} (第 {attempt} 次)，回應：{preview}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.3)
+            time.sleep(0.5 * attempt)
             continue
 
         try:
@@ -767,7 +784,7 @@ def _translate_with_google(text, target_lang):
             print(f"❌ 解析 Google 翻譯回應失敗 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.3)
+            time.sleep(0.5 * attempt)
             continue
 
     return None
