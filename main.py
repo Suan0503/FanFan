@@ -59,7 +59,9 @@ data = {
     "voice_translation": {},
     "group_admin": {},  # 新增：儲存群組暫時管理員
     # 每個群組的翻譯引擎偏好："google" 或 "deepl"，預設為 google
-    "translate_engine_pref": {}
+    "translate_engine_pref": {},
+    # 新增：功能開關配置 - 依據 TOKEN 控制不同群組可用的功能
+    "feature_switches": {}  # 格式: {"group_id": {"features": ["translate", "voice", "admin"], "token": "xxxx"}}
 }
 
 start_time = time.time()
@@ -80,7 +82,8 @@ def load_data():
                     },
                     "voice_translation": loaded_data.get("voice_translation", {}),
                     "group_admin": loaded_data.get("group_admin", {}),  # 新增
-                    "translate_engine_pref": loaded_data.get("translate_engine_pref", {})
+                    "translate_engine_pref": loaded_data.get("translate_engine_pref", {}),
+                    "feature_switches": loaded_data.get("feature_switches", {})  # 新增
                 }
                 print("✅ 成功讀取資料！")
             except Exception as e:
@@ -98,7 +101,8 @@ def save_data():
         },
         "voice_translation": data["voice_translation"],
         "group_admin": data.get("group_admin", {}),  # 新增
-        "translate_engine_pref": data.get("translate_engine_pref", {})
+        "translate_engine_pref": data.get("translate_engine_pref", {}),
+        "feature_switches": data.get("feature_switches", {})  # 新增
     }
     with open("data.json", "w", encoding="utf-8") as f:
         json.dump(save_data, f, ensure_ascii=False, indent=2)
@@ -484,11 +488,59 @@ LANGUAGE_MAP = {
     '🇷🇺 俄文': 'ru'
 }
 
+# --- 功能開關系統 ---
+FEATURE_LIST = {
+    "translate": "翻譯功能",
+    "voice": "語音翻譯",
+    "admin": "管理功能",
+    "auto_translate": "自動翻譯",
+    "statistics": "統計功能"
+}
+
+def generate_group_token():
+    """生成唯一的群組 TOKEN"""
+    import secrets
+    return secrets.token_urlsafe(16)
+
+def set_group_features(group_id, features, token=None):
+    """設定群組可用的功能列表"""
+    if not token:
+        token = generate_group_token()
+    
+    data.setdefault("feature_switches", {})
+    data["feature_switches"][group_id] = {
+        "features": features,
+        "token": token,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    save_data()
+    return token
+
+def get_group_features(group_id):
+    """取得群組可用的功能列表，預設為所有功能"""
+    feature_switches = data.get("feature_switches", {})
+    if group_id not in feature_switches:
+        # 預設給予所有功能
+        return list(FEATURE_LIST.keys())
+    return feature_switches[group_id].get("features", [])
+
+def check_feature_enabled(group_id, feature_name):
+    """檢查群組是否啟用某項功能"""
+    enabled_features = get_group_features(group_id)
+    return feature_name in enabled_features
+
+def get_group_token(group_id):
+    """取得群組的 TOKEN"""
+    feature_switches = data.get("feature_switches", {})
+    if group_id in feature_switches:
+        return feature_switches[group_id].get("token")
+    return None
+
 def create_command_menu():
-    """創建指令選單"""
+    """創建新年風格指令選單"""
     return {
         "type": "flex",
-        "altText": "⚡ 系統管理選單",
+        "altText": "🎊 新春管理選單",
         "contents": {
             "type": "bubble",
             "header": {
@@ -496,17 +548,19 @@ def create_command_menu():
                 "layout": "vertical",
                 "contents": [{
                     "type": "text",
-                    "text": "⚡ 系統管理面板",
+                    "text": "🎊 新春管理面板",
                     "weight": "bold",
                     "size": "xl",
-                    "color": "#1DB446"
+                    "color": "#FF0000"
                 }, {
                     "type": "text",
-                    "text": "請選擇要執行的操作",
+                    "text": "🧧 恭喜發財 萬事如意 🧧",
                     "size": "sm",
-                    "color": "#666666"
+                    "color": "#FFD700",
+                    "weight": "bold",
+                    "align": "center"
                 }],
-                "backgroundColor": "#FFFFFF"
+                "backgroundColor": "#FFF5F5"
             },
             "body": {
                 "type": "box",
@@ -515,7 +569,7 @@ def create_command_menu():
                 "contents": [{
                     "type": "button",
                     "style": "primary",
-                    "color": "#1DB446",
+                    "color": "#DC143C",
                     "action": {
                         "type": "message",
                         "label": "📊 系統狀態",
@@ -525,7 +579,7 @@ def create_command_menu():
                 }, {
                     "type": "button",
                     "style": "primary",
-                    "color": "#4A90E2",
+                    "color": "#FF6347",
                     "action": {
                         "type": "message",
                         "label": "💾 記憶體使用",
@@ -535,7 +589,7 @@ def create_command_menu():
                 }, {
                     "type": "button",
                     "style": "primary",
-                    "color": "#FF6B6B",
+                    "color": "#FF4500",
                     "action": {
                         "type": "message",
                         "label": "🔄 重啟系統",
@@ -545,7 +599,7 @@ def create_command_menu():
                 }, {
                     "type": "button",
                     "style": "primary",
-                    "color": "#6B7280",
+                    "color": "#FFD700",
                     "action": {
                         "type": "message",
                         "label": "📝 今日流量",
@@ -555,7 +609,7 @@ def create_command_menu():
                 }, {
                     "type": "button",
                     "style": "primary",
-                    "color": "#805AD5",
+                    "color": "#FF8C00",
                     "action": {
                         "type": "message",
                         "label": "👥 管理員列表",
@@ -569,28 +623,30 @@ def create_command_menu():
                 "layout": "vertical",
                 "contents": [{
                     "type": "text",
-                    "text": "🔒 系統管理專用",
+                    "text": "🏮 祝您新年快樂 龍年大吉 🏮",
                     "size": "sm",
-                    "color": "#666666",
-                    "align": "center"
+                    "color": "#DC143C",
+                    "align": "center",
+                    "weight": "bold"
                 }]
             },
             "styles": {
                 "header": {
-                    "backgroundColor": "#F9FAFB"
+                    "backgroundColor": "#FFF5F5"
                 },
                 "body": {
-                    "backgroundColor": "#FFFFFF"
+                    "backgroundColor": "#FFFAF0"
                 },
                 "footer": {
-                    "separator": True
+                    "separator": True,
+                    "backgroundColor": "#FFF5F5"
                 }
             }
         }
     }
 
 def language_selection_message(group_id):
-    """群組翻譯語言選單，會依目前設定在按鈕前顯示 ✅。"""
+    """新年風格群組翻譯語言選單，會依目前設定在按鈕前顯示 ✅。"""
 
     current_langs = get_group_langs(group_id)
 
@@ -601,7 +657,7 @@ def language_selection_message(group_id):
         contents.append({
             "type": "button",
             "style": "primary",
-            "color": "#1DB446" if selected else "#0099FF",
+            "color": "#DC143C" if selected else "#FF6347",
             "action": {
                 "type": "postback",
                 "label": button_label,
@@ -621,7 +677,7 @@ def language_selection_message(group_id):
 
     return {
         "type": "flex",
-        "altText": "🌍 請選擇翻譯語言",
+        "altText": "🎊 新春翻譯設定",
         "contents": {
             "type": "bubble",
             "header": {
@@ -629,16 +685,24 @@ def language_selection_message(group_id):
                 "layout": "vertical",
                 "contents": [{
                     "type": "text",
-                    "text": "🌍 群組翻譯設定",
+                    "text": "🎊 群組翻譯設定",
                     "weight": "bold",
                     "size": "lg",
-                    "color": "#0099FF"
+                    "color": "#DC143C"
                 }, {
                     "type": "text",
                     "text": "請加上 / 取消要翻譯成的語言，可複選。",
                     "size": "sm",
                     "color": "#555555",
                     "wrap": True
+                }, {
+                    "type": "text",
+                    "text": "🧧 新年快樂 🧧",
+                    "size": "xs",
+                    "color": "#FFD700",
+                    "weight": "bold",
+                    "align": "center",
+                    "margin": "md"
                 }]
             },
             "body": {
@@ -660,8 +724,11 @@ def language_selection_message(group_id):
                 }]
             },
             "styles": {
+                "header": {
+                    "backgroundColor": "#FFF5F5"
+                },
                 "body": {
-                    "backgroundColor": "#E0F7FF"
+                    "backgroundColor": "#FFFAF0"
                 },
                 "footer": {
                     "separator": True
@@ -1025,6 +1092,88 @@ def webhook():
                     })
                 continue
 
+            # --- 功能管理指令（僅主人可用） ---
+            if lower in ['/功能設定', '/features']:
+                if user_id not in MASTER_USER_IDS:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 只有主人可以設定功能開關喲～"
+                    })
+                    continue
+                
+                features = get_group_features(group_id)
+                token = get_group_token(group_id)
+                
+                features_text = '\n'.join([
+                    f"{'✅' if f in features else '❌'} {FEATURE_LIST[f]}" 
+                    for f in FEATURE_LIST.keys()
+                ])
+                
+                token_text = f"\n\n🔑 群組 TOKEN: {token}" if token else "\n\n🆕 尚未生成 TOKEN"
+                
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": f"⚙️ 群組功能狀態\n\n{features_text}{token_text}\n\n💡 使用「/設定功能 [功能名]」來開啟/關閉功能"
+                })
+                continue
+            
+            if lower.startswith('/設定功能 '):
+                if user_id not in MASTER_USER_IDS:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 只有主人可以設定功能開關喲～"
+                    })
+                    continue
+                
+                parts = text.split()
+                if len(parts) < 2:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 格式錯誤，請使用：/設定功能 [translate/voice/admin/auto_translate/statistics]"
+                    })
+                    continue
+                
+                feature = parts[1]
+                if feature not in FEATURE_LIST:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": f"❌ 未知的功能名稱。可用功能：\n" + '\n'.join([f"• {k}: {v}" for k, v in FEATURE_LIST.items()])
+                    })
+                    continue
+                
+                features = get_group_features(group_id)
+                if feature in features:
+                    features.remove(feature)
+                    status = "關閉"
+                else:
+                    features.append(feature)
+                    status = "開啟"
+                
+                token = set_group_features(group_id, features, get_group_token(group_id))
+                
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": f"✅ 已{status} {FEATURE_LIST[feature]} 功能！\n\n🔑 群組 TOKEN: {token}"
+                })
+                continue
+            
+            if lower in ['/生成token', '/generate_token']:
+                if user_id not in MASTER_USER_IDS:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 只有主人可以生成 TOKEN 喲～"
+                    })
+                    continue
+                
+                features = get_group_features(group_id)
+                token = set_group_features(group_id, features)
+                
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": f"🎊 已生成新的群組 TOKEN！\n\n🔑 TOKEN: {token}\n\n⚠️ 請妥善保管，此 TOKEN 可用於 API 存取控制"
+                })
+                continue
+
             # 只有主人可以用系統管理（指令權限不變）
             if '我的id' in lower:
                 reply(event['replyToken'], {
@@ -1082,6 +1231,14 @@ def webhook():
 
             # --- 語言選單（中文化，保留舊指令） ---
             if lower in ['/選單', '/menu', 'menu', '翻譯選單', '/翻譯選單']:
+                # 檢查翻譯功能是否開啟
+                if not check_feature_enabled(group_id, "translate"):
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 本群組未開啟翻譯功能，請聯絡管理員。"
+                    })
+                    continue
+                    
                 # 判斷是否已有暫時管理員
                 has_admin = data.get('group_admin', {}).get(group_id) is not None
                 is_privileged = user_id in MASTER_USER_IDS or user_id in data.get(
@@ -1176,6 +1333,14 @@ def webhook():
                     })
                 continue
             if lower in ['/統計', '翻譯統計']:
+                # 檢查統計功能是否開啟
+                if not check_feature_enabled(group_id, "statistics"):
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 本群組未開啟統計功能，請聯絡管理員。"
+                    })
+                    continue
+                    
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist']:
                     lang_sets = get_group_stats_for_status()
@@ -1196,6 +1361,14 @@ def webhook():
                     })
                 continue
             if lower == '語音翻譯':
+                # 檢查語音功能是否開啟
+                if not check_feature_enabled(group_id, "voice"):
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 本群組未開啟語音翻譯功能，請聯絡管理員。"
+                    })
+                    continue
+                    
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist'] or is_group_admin(user_id, group_id):
                     current_status = data['voice_translation'].get(
@@ -1215,6 +1388,14 @@ def webhook():
                 continue
 
             if lower == '自動翻譯':
+                # 檢查自動翻譯功能是否開啟
+                if not check_feature_enabled(group_id, "auto_translate"):
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 本群組未開啟自動翻譯功能，請聯絡管理員。"
+                    })
+                    continue
+                    
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist'] or is_group_admin(user_id, group_id):
                     if 'auto_translate' not in data:
@@ -1251,7 +1432,7 @@ def webhook():
 
             # 檢查是否開啟自動翻譯
             auto_translate = data.get('auto_translate', {}).get(group_id, True)
-            if auto_translate:
+            if auto_translate and check_feature_enabled(group_id, "translate"):
                 langs = get_group_langs(group_id)
 
                 # 依群組設定決定翻譯引擎先後順序（預設 Google 優先）
@@ -1267,6 +1448,13 @@ def webhook():
                     daemon=True).start()
                 continue
             elif text.startswith('!翻譯'):  # 手動翻譯指令
+                if not check_feature_enabled(group_id, "translate"):
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 本群組未開啟翻譯功能，請聯絡管理員。"
+                    })
+                    continue
+                    
                 text_to_translate = text[3:].strip()
                 if text_to_translate:
                     langs = get_group_langs(group_id)
