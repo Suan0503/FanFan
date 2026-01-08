@@ -8,7 +8,7 @@ import threading
 from datetime import datetime, timedelta
 from flask_sqlalchemy import SQLAlchemy
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import TextSendMessage
+from linebot.models import TextSendMessage, MessageEvent, TextMessage, JoinEvent, PostbackEvent
 from dotenv import load_dotenv
 
 app = Flask(__name__)
@@ -110,7 +110,7 @@ load_data()
 # --- 群組翻譯設定（資料庫 + 舊 data.json 並存） ---
 if db:
     class GroupTranslateSetting(db.Model):  # type: ignore[misc]
-        """群組翻譯設定：每個群組選擇的目標語言清單。"""
+        """群組翻譯設定：包含語言清單、引擎偏好與最後活躍時間。"""
 
         __tablename__ = "group_translate_setting"
 
@@ -118,33 +118,12 @@ if db:
         group_id = db.Column(db.String(255), unique=True, nullable=False)
         # 以逗號分隔的語言代碼，例如："en,zh-TW,ja"
         languages = db.Column(db.String(255), nullable=False, default="en")
-        created_at = db.Column(db.DateTime,
-                               default=datetime.utcnow,
-                               nullable=False)
-        updated_at = db.Column(db.DateTime,
-                               default=datetime.utcnow,
-                               onupdate=datetime.utcnow,
-                               nullable=False)
-
-    class GroupActivity(db.Model):  # type: ignore[misc]
-        """紀錄群組最後活躍時間，用來判斷是否自動退出群組。"""
-
-        __tablename__ = "group_activity"
-
-        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-        group_id = db.Column(db.String(255), unique=True, nullable=False)
+        # 翻譯引擎偏好：google 或 deepl
+        engine = db.Column(db.String(20), nullable=False, default="google")
+        # 最後活躍時間（用於 20 天自動退群）
         last_active_at = db.Column(db.DateTime,
                                    default=datetime.utcnow,
                                    nullable=False)
-
-    class GroupEnginePreference(db.Model):  # type: ignore[misc]
-        """每個群組的翻譯引擎偏好（google / deepl）。"""
-
-        __tablename__ = "group_engine_preference"
-
-        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-        group_id = db.Column(db.String(255), unique=True, nullable=False)
-        engine = db.Column(db.String(20), nullable=False, default="google")
         created_at = db.Column(db.DateTime,
                                default=datetime.utcnow,
                                nullable=False)
@@ -157,11 +136,12 @@ if db:
     with app.app_context():
         db.create_all()
 
-        # 啟動時，嘗試將舊的 data.json 內 user_prefs 同步到資料庫
+        # 啟動時，同步 data.json 的所有設定到資料庫
         try:
             user_prefs = data.get("user_prefs", {})
+            engine_prefs = data.get("translate_engine_pref", {})
             migrated_count = 0
-            activity_count = 0
+            
             for group_id, langs in user_prefs.items():
                 if not group_id:
                     continue
@@ -173,74 +153,38 @@ if db:
                     continue
 
                 lang_str = ",".join(sorted(lang_set))
+                engine = engine_prefs.get(group_id, "google")
 
                 setting = GroupTranslateSetting.query.filter_by(
                     group_id=group_id).first()
                 if not setting:
-                    setting = GroupTranslateSetting(group_id=group_id,
-                                                   languages=lang_str)
+                    setting = GroupTranslateSetting(
+                        group_id=group_id,
+                        languages=lang_str,
+                        engine=engine,
+                        last_active_at=datetime.utcnow()
+                    )
                     db.session.add(setting)
                     migrated_count += 1
                 else:
-                    # 若資料庫本來就沒寫入 languages，補上一次即可
+                    # 更新已存在的設定
                     if not setting.languages:
                         setting.languages = lang_str
-                        migrated_count += 1
+                    if not hasattr(setting, 'engine') or not setting.engine:
+                        setting.engine = engine
+                    if not hasattr(setting, 'last_active_at') or not setting.last_active_at:
+                        setting.last_active_at = datetime.utcnow()
+                    migrated_count += 1
 
-                # 確保已有翻譯設定的群組，同步建立 GroupActivity，
-                # 讓舊群組從「現在」開始重新計算 20 天未使用。
-                activity = GroupActivity.query.filter_by(
-                    group_id=group_id).first()
-                if not activity:
-                    activity = GroupActivity(group_id=group_id,
-                                             last_active_at=datetime.utcnow())
-                    db.session.add(activity)
-                    activity_count += 1
-
-            if migrated_count or activity_count:
+            if migrated_count:
                 db.session.commit()
-                print(f"✅ 已將 {migrated_count} 組舊翻譯設定同步到資料庫，並為 {activity_count} 個群組建立活躍記錄")
+                print(f"✅ 已將 {migrated_count} 組設定同步到資料庫")
         except Exception as e:
             db.session.rollback()
-            print(f"❌ 同步舊翻譯設定到資料庫失敗: {e}")
-
-        # 啟動時，將舊的 data.json 內 translate_engine_pref 同步到資料庫
-        try:
-            engine_prefs = data.get("translate_engine_pref", {})
-            migrated_engine_count = 0
-            for group_id, engine in engine_prefs.items():
-                if not group_id:
-                    continue
-                if engine not in ("google", "deepl"):
-                    continue
-
-                pref = GroupEnginePreference.query.filter_by(
-                    group_id=group_id).first()
-                if not pref:
-                    pref = GroupEnginePreference(group_id=group_id,
-                                                 engine=engine)
-                    db.session.add(pref)
-                    migrated_engine_count += 1
-                else:
-                    if pref.engine != engine:
-                        pref.engine = engine
-                        migrated_engine_count += 1
-
-            if migrated_engine_count:
-                db.session.commit()
-                print(f"✅ 已將 {migrated_engine_count} 組引擎偏好同步到資料庫")
-        except Exception as e:
-            db.session.rollback()
-            print(f"❌ 同步引擎偏好到資料庫失敗: {e}")
+            print(f"❌ 同步設定到資料庫失敗: {e}")
 else:
     # 沒有設定資料庫時提供一個空的 placeholder 類別，避免型別檢查錯誤
     class GroupTranslateSetting:  # type: ignore[misc]
-        pass
-
-    class GroupActivity:  # type: ignore[misc]
-        pass
-
-    class GroupEnginePreference:  # type: ignore[misc]
         pass
 
 
@@ -342,14 +286,16 @@ def touch_group_activity(group_id):
     if not db or not group_id:
         return
     try:
-        activity = GroupActivity.query.filter_by(group_id=group_id).first()
+        setting = GroupTranslateSetting.query.filter_by(group_id=group_id).first()
         now = datetime.utcnow()
-        if not activity:
-            activity = GroupActivity(group_id=group_id,
-                                     last_active_at=now)
-            db.session.add(activity)
+        if not setting:
+            setting = GroupTranslateSetting(
+                group_id=group_id,
+                last_active_at=now
+            )
+            db.session.add(setting)
         else:
-            activity.last_active_at = now
+            setting.last_active_at = now
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -361,10 +307,10 @@ def get_engine_pref(group_id):
     # 先看資料庫
     if db and group_id:
         try:
-            pref = GroupEnginePreference.query.filter_by(
+            setting = GroupTranslateSetting.query.filter_by(
                 group_id=group_id).first()
-            if pref and pref.engine in ("google", "deepl"):
-                return pref.engine
+            if setting and setting.engine in ("google", "deepl"):
+                return setting.engine
         except Exception:
             pass
 
@@ -388,14 +334,17 @@ def set_engine_pref(group_id, engine):
     if not db or not group_id:
         return
     try:
-        pref = GroupEnginePreference.query.filter_by(
+        setting = GroupTranslateSetting.query.filter_by(
             group_id=group_id).first()
-        if not pref:
-            pref = GroupEnginePreference(group_id=group_id,
-                                         engine=engine)
-            db.session.add(pref)
+        if not setting:
+            setting = GroupTranslateSetting(
+                group_id=group_id,
+                engine=engine,
+                last_active_at=datetime.utcnow()
+            )
+            db.session.add(setting)
         else:
-            pref.engine = engine
+            setting.engine = engine
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -409,16 +358,16 @@ def check_inactive_groups():
 
     try:
         threshold = datetime.utcnow() - timedelta(days=20)
-        inactive = GroupActivity.query.filter(
-            GroupActivity.last_active_at < threshold).all()
+        inactive = GroupTranslateSetting.query.filter(
+            GroupTranslateSetting.last_active_at < threshold).all()
     except Exception:
         return
 
     if not inactive:
         return
 
-    for activity in inactive:
-        group_id = activity.group_id
+    for setting in inactive:
+        group_id = setting.group_id
         try:
             print(f"🚪 超過 20 天未使用，自動退出群組: {group_id}")
             line_bot_api.leave_group(group_id)
@@ -435,6 +384,8 @@ def check_inactive_groups():
                 data['group_admin'].pop(group_id, None)
             if 'auto_translate' in data:
                 data['auto_translate'].pop(group_id, None)
+            if 'translate_engine_pref' in data:
+                data['translate_engine_pref'].pop(group_id, None)
             save_data()
         except Exception:
             pass
@@ -443,11 +394,7 @@ def check_inactive_groups():
         if not db:
             continue
         try:
-            setting = GroupTranslateSetting.query.filter_by(
-                group_id=group_id).first()
-            if setting:
-                db.session.delete(setting)
-            db.session.delete(activity)
+            db.session.delete(setting)
             db.session.commit()
         except Exception:
             db.session.rollback()
@@ -866,74 +813,56 @@ def is_group_admin(user_id, group_id):
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    body = request.get_json()
-    events = body.get("events", [])
-    for event in events:
-        source = event.get("source", {})
-        group_id = source.get("groupId") or source.get("userId")
-        user_id = source.get("userId")
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    
+    try:
+        handler.handle(body, signature)
+    except Exception as e:
+        print(f"❌ Webhook 處理錯誤: {e}")
+    
+    return 'OK'
+
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text_message(event):
+    from linebot.models import MessageEvent, TextMessage
+    
+    # 模擬原本的 event 結構以保持向下兼容
+    class EventWrapper:
+        def __init__(self, line_event):
+            self._event = line_event
+            self.reply_token = line_event.reply_token
+            self.message = line_event.message
+            self.source = line_event.source
+            
+        def get(self, key, default=None):
+            return getattr(self._event, key, default)
+    
+    wrapped_event = EventWrapper(event)
+    
+    # 以下保持原有邏輯
+    for event in [wrapped_event]:
+        # 從 LINE event 取得基本資訊
+        source = event.source
+        group_id = getattr(source, 'group_id', None) or getattr(source, 'user_id', None)
+        user_id = getattr(source, 'user_id', None)
+        
         if not group_id or not user_id:
             continue
-        event_type = event.get("type")
-
+            
         # 若是群組事件，更新最後活躍時間
-        raw_group_id = source.get("groupId")
+        raw_group_id = getattr(source, 'group_id', None)
         if raw_group_id:
             touch_group_activity(raw_group_id)
 
-        # --- 機器人被加進群組時公告 + 自動跳出語言選單 ---
-        if event_type == 'join':
-            reply(event['replyToken'], [
-                {
-                    "type": "text",
-                    "text": "👋 歡迎邀請翻譯小精靈進入群組！\n\n請本群管理員或群主按下下面的「翻譯設定」，選擇要翻譯成哪些語言，之後群組內的訊息就會自動翻譯。"
-                },
-                language_selection_message(group_id)
-            ])
-            continue
-
-        # --- 處理 postback 設定語言 ---
-        if event_type == 'postback':
-            data_post = event['postback']['data']
-            if user_id not in MASTER_USER_IDS and \
-               user_id not in data['user_whitelist'] and \
-               not is_group_admin(user_id, group_id):
-                reply(event['replyToken'], {
-                    "type": "text",
-                    "text": "❌ 只有授權使用者可以更改翻譯設定喲～"
-                })
-                continue
-            if data_post == 'reset':
-                _delete_group_langs_from_db(group_id)
-                reply(event['replyToken'], {
-                    "type": "text",
-                    "text": "✅ 已清除翻譯語言設定！"
-                })
-            elif data_post.startswith('lang:'):
-                code = data_post.split(':')[1]
-                current_langs = get_group_langs(group_id)
-                if code in current_langs:
-                    current_langs.remove(code)
-                else:
-                    current_langs.add(code)
-                set_group_langs(group_id, current_langs)
-                langs = [
-                    f"{label} ({code})"
-                    for label, code in LANGUAGE_MAP.items()
-                    if code in get_group_langs(group_id)
-                ]
-                langs_str = '\n'.join(langs) if langs else '(無)'
-                reply(event['replyToken'], {
-                    "type": "text",
-                    "text": f"✅ 已更新翻譯語言！\n\n目前設定語言：\n{langs_str}"
-                })
-
-        elif event_type == 'message':
-            msg_type = event['message']['type']
-            if msg_type != 'text':
-                continue
-            text = event['message']['text'].strip()
-            lower = text.lower()
+        # 處理文字訊息
+        msg_type = event.message.type
+        if msg_type != 'text':
+            return
+            
+        text = event.message.text.strip()
+        lower = text.lower()
 
             # --- 切換本群預設翻譯引擎為 DeepL 優先 ---
             # 預設為 Google -> DeepL，若輸入 "DEEPL" 則改為 DeepL -> Google
@@ -1264,6 +1193,81 @@ def webhook():
                         daemon=True).start()
                     continue
     return 'OK'
+
+
+@handler.add(JoinEvent)
+def handle_join(event):
+    """處理機器人被加進群組事件"""
+    from linebot.models import JoinEvent
+    
+    source = event.source
+    group_id = getattr(source, 'group_id', None) or getattr(source, 'user_id', None)
+    
+    if group_id:
+        touch_group_activity(group_id)
+        reply(event.reply_token, [
+            {
+                "type": "text",
+                "text": "👋 歡迎邀請翻譯小精靈進入群組！\n\n請本群管理員或群主按下下面的「翻譯設定」，選擇要翻譯成哪些語言，之後群組內的訊息就會自動翻譯。"
+            },
+            language_selection_message(group_id)
+        ])
+
+
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    """處理 postback 設定語言"""
+    from linebot.models import PostbackEvent
+    
+    source = event.source
+    group_id = getattr(source, 'group_id', None) or getattr(source, 'user_id', None)
+    user_id = getattr(source, 'user_id', None)
+    
+    if not group_id or not user_id:
+        return
+        
+    # 更新活躍時間
+    raw_group_id = getattr(source, 'group_id', None)
+    if raw_group_id:
+        touch_group_activity(raw_group_id)
+    
+    data_post = event.postback.data
+    
+    # 權限檢查
+    if user_id not in MASTER_USER_IDS and \
+       user_id not in data['user_whitelist'] and \
+       not is_group_admin(user_id, group_id):
+        reply(event.reply_token, {
+            "type": "text",
+            "text": "❌ 只有授權使用者可以更改翻譯設定喲～"
+        })
+        return
+        
+    if data_post == 'reset':
+        _delete_group_langs_from_db(group_id)
+        reply(event.reply_token, {
+            "type": "text",
+            "text": "✅ 已清除翻譯語言設定！"
+        })
+    elif data_post.startswith('lang:'):
+        code = data_post.split(':')[1]
+        current_langs = get_group_langs(group_id)
+        if code in current_langs:
+            current_langs.remove(code)
+        else:
+            current_langs.add(code)
+        set_group_langs(group_id, current_langs)
+        langs = [
+            f"{label} ({code})"
+            for label, code in LANGUAGE_MAP.items()
+            if code in get_group_langs(group_id)
+        ]
+        langs_str = '\n'.join(langs) if langs else '(無)'
+        reply(event.reply_token, {
+            "type": "text",
+            "text": f"✅ 已更新翻譯語言！\n\n目前設定語言：\n{langs_str}"
+        })
+
 
 @app.route("/images/<path:filename>")
 def serve_image(filename):
