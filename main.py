@@ -60,13 +60,12 @@ data = {
     "group_admin": {},  # 新增：儲存群組暫時管理員
     # 每個群組的翻譯引擎偏好："google" 或 "deepl"，預設為 google
     "translate_engine_pref": {},
-    # 新增：功能開關配置 - 依據 TOKEN 控制不同群組可用的功能
-    "feature_switches": {}  # 格式: {"group_id": {"features": ["translate", "voice", "admin"], "token": "xxxx"}}
+    # 租戶管理系統 - 基於個人TOKEN的訂閱制
+    "tenants": {}  # 格式: {"user_id": {"token": "xxxx", "expires_at": "2026-02-08", "groups": ["G1", "G2"], "stats": {"translate_count": 0, "char_count": 0}}}
 }
 
 start_time = time.time()
-translate_counter = 0
-translate_char_counter = 0
+# 移除全域統計，改為 per-tenant
 
 def load_data():
     global data
@@ -81,9 +80,9 @@ def load_data():
                         for k, v in loaded_data.get("user_prefs", {}).items()
                     },
                     "voice_translation": loaded_data.get("voice_translation", {}),
-                    "group_admin": loaded_data.get("group_admin", {}),  # 新增
+                    "group_admin": loaded_data.get("group_admin", {}),
                     "translate_engine_pref": loaded_data.get("translate_engine_pref", {}),
-                    "feature_switches": loaded_data.get("feature_switches", {})  # 新增
+                    "tenants": loaded_data.get("tenants", {})  # 租戶系統
                 }
                 print("✅ 成功讀取資料！")
             except Exception as e:
@@ -100,9 +99,9 @@ def save_data():
             for k, v in data["user_prefs"].items()
         },
         "voice_translation": data["voice_translation"],
-        "group_admin": data.get("group_admin", {}),  # 新增
+        "group_admin": data.get("group_admin", {}),
         "translate_engine_pref": data.get("translate_engine_pref", {}),
-        "feature_switches": data.get("feature_switches", {})  # 新增
+        "tenants": data.get("tenants", {})  # 租戶系統
     }
     with open("data.json", "w", encoding="utf-8") as f:
         json.dump(save_data, f, ensure_ascii=False, indent=2)
@@ -488,53 +487,82 @@ LANGUAGE_MAP = {
     '🇷🇺 俄文': 'ru'
 }
 
-# --- 功能開關系統 ---
-FEATURE_LIST = {
-    "translate": "翻譯功能",
-    "voice": "語音翻譯",
-    "admin": "管理功能",
-    "auto_translate": "自動翻譯",
-    "statistics": "統計功能"
-}
-
-def generate_group_token():
-    """生成唯一的群組 TOKEN"""
+# --- 租戶管理系統 ---
+def generate_tenant_token():
+    """生成唯一的租戶 TOKEN"""
     import secrets
     return secrets.token_urlsafe(16)
 
-def set_group_features(group_id, features, token=None):
-    """設定群組可用的功能列表"""
-    if not token:
-        token = generate_group_token()
+def create_tenant(user_id, months=1):
+    """創建租戶訂閱"""
+    token = generate_tenant_token()
+    expires_at = (datetime.utcnow() + timedelta(days=30 * months)).isoformat()
     
-    data.setdefault("feature_switches", {})
-    data["feature_switches"][group_id] = {
-        "features": features,
+    data.setdefault("tenants", {})
+    data["tenants"][user_id] = {
         "token": token,
+        "expires_at": expires_at,
+        "groups": [],
+        "stats": {
+            "translate_count": 0,
+            "char_count": 0
+        },
         "created_at": datetime.utcnow().isoformat()
     }
     save_data()
-    return token
+    return token, expires_at
 
-def get_group_features(group_id):
-    """取得群組可用的功能列表，預設為所有功能"""
-    feature_switches = data.get("feature_switches", {})
-    if group_id not in feature_switches:
-        # 預設給予所有功能
-        return list(FEATURE_LIST.keys())
-    return feature_switches[group_id].get("features", [])
+def get_tenant_by_group(group_id):
+    """根據群組ID取得租戶"""
+    tenants = data.get("tenants", {})
+    for user_id, tenant in tenants.items():
+        if group_id in tenant.get("groups", []):
+            return user_id, tenant
+    return None, None
 
-def check_feature_enabled(group_id, feature_name):
-    """檢查群組是否啟用某項功能"""
-    enabled_features = get_group_features(group_id)
-    return feature_name in enabled_features
+def is_tenant_valid(user_id):
+    """檢查租戶是否有效（未過期）"""
+    tenants = data.get("tenants", {})
+    if user_id not in tenants:
+        return False
+    
+    expires_at = tenants[user_id].get("expires_at")
+    if not expires_at:
+        return False
+    
+    try:
+        expire_dt = datetime.fromisoformat(expires_at)
+        return datetime.utcnow() < expire_dt
+    except:
+        return False
 
-def get_group_token(group_id):
-    """取得群組的 TOKEN"""
-    feature_switches = data.get("feature_switches", {})
-    if group_id in feature_switches:
-        return feature_switches[group_id].get("token")
-    return None
+def add_group_to_tenant(user_id, group_id):
+    """將群組加入租戶管理"""
+    tenants = data.get("tenants", {})
+    if user_id not in tenants:
+        return False
+    
+    if group_id not in tenants[user_id].get("groups", []):
+        tenants[user_id].setdefault("groups", []).append(group_id)
+        save_data()
+    return True
+
+def update_tenant_stats(user_id, translate_count=0, char_count=0):
+    """更新租戶統計資料"""
+    tenants = data.get("tenants", {})
+    if user_id in tenants:
+        stats = tenants[user_id].setdefault("stats", {"translate_count": 0, "char_count": 0})
+        stats["translate_count"] = stats.get("translate_count", 0) + translate_count
+        stats["char_count"] = stats.get("char_count", 0) + char_count
+        save_data()
+
+def check_group_access(group_id):
+    """檢查群組是否有有效的租戶訂閱（預設全開放）"""
+    user_id, tenant = get_tenant_by_group(group_id)
+    if user_id:
+        return is_tenant_valid(user_id)
+    # 預設：未設定租戶的群組全功能開放
+    return True
 
 def create_command_menu():
     """創建新年風格指令選單"""
@@ -857,49 +885,44 @@ def _translate_with_google(text, target_lang):
     return None
 
 
-def translate_text(text, target_lang, prefer_deepl_first=False):
-    """統一翻譯入口：
+def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
+    """統一翻譯入口：只使用一種引擎，不備援"""
 
-    - 預設先用 Google，再用 DeepL 當備援；
-    - 若 prefer_deepl_first=True，則先 DeepL，再 Google。
-    """
-
-    global translate_counter, translate_char_counter
-
+    # 根據偏好選擇引擎
     if prefer_deepl_first:
-        first, second = _translate_with_deepl, _translate_with_google
+        translated = _translate_with_deepl(text, target_lang)
     else:
-        first, second = _translate_with_google, _translate_with_deepl
-
-    translated = first(text, target_lang)
-    if translated is None:
-        translated = second(text, target_lang)
+        translated = _translate_with_google(text, target_lang)
 
     if translated is None:
         return "翻譯失敗QQ"
 
-    translate_counter += 1
-    translate_char_counter += len(text)
+    # 更新 per-tenant 統計
+    if group_id:
+        user_id, tenant = get_tenant_by_group(group_id)
+        if user_id:
+            update_tenant_stats(user_id, translate_count=1, char_count=len(text))
+    
     return translated
 
 
-def _format_translation_results(text, langs, prefer_deepl_first=False):
+def _format_translation_results(text, langs, prefer_deepl_first=False, group_id=None):
     """將多語言翻譯結果組成一段文字。"""
 
     results = []
     for lang in langs:
-        translated = translate_text(text, lang, prefer_deepl_first=prefer_deepl_first)
+        translated = translate_text(text, lang, prefer_deepl_first=prefer_deepl_first, group_id=group_id)
         results.append(f"[{lang}] {translated}")
     return '\n'.join(results)
 
 
-def _async_translate_and_reply(reply_token, text, langs, prefer_deepl_first=False):
+def _async_translate_and_reply(reply_token, text, langs, prefer_deepl_first=False, group_id=None):
     """在背景執行緒中翻譯並用 reply_message 回覆，避免阻塞 webhook。"""
 
     try:
         # 為了避免 set 在其他地方被修改，先轉成 list
         lang_list = list(langs)
-        result_text = _format_translation_results(text, lang_list, prefer_deepl_first=prefer_deepl_first)
+        result_text = _format_translation_results(text, lang_list, prefer_deepl_first=prefer_deepl_first, group_id=group_id)
         line_bot_api.reply_message(reply_token,
                                    TextSendMessage(text=result_text))
     except Exception as e:
@@ -950,6 +973,16 @@ def is_group_admin(user_id, group_id):
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
+    # 簽名驗證
+    signature = request.headers.get('X-Line-Signature')
+    body_text = request.get_data(as_text=True)
+    
+    try:
+        handler.handle(body_text, signature)
+    except Exception as e:
+        print(f"❌ Webhook 簽名驗證失敗: {e}")
+        return 'Invalid signature', 400
+    
     body = request.get_json()
     events = body.get("events", [])
     for event in events:
@@ -1052,22 +1085,57 @@ def webhook():
                         })
                 continue
 
-            # --- 主人換管理員 ---
-            if (lower.startswith('/換管理員') or lower.startswith('換管理員')) and user_id in MASTER_USER_IDS:
+            # --- 主人設定租戶管理員 ---
+            if (lower.startswith('/設定管理員') or lower.startswith('設定管理員')) and user_id in MASTER_USER_IDS:
                 parts = text.replace('　', ' ').split()
-                if len(parts) == 2:
-                    new_admin = parts[1]
+                # 格式: /設定管理員 @某人 [1-12]
+                if len(parts) >= 3:
+                    # 提取 user_id 和月份
+                    mentioned_users = []
+                    # 從 event 中取得 mention 資訊
+                    message = event.get('message', {})
+                    if 'mention' in message:
+                        mentions = message['mention'].get('mentionees', [])
+                        for mention in mentions:
+                            if mention.get('type') == 'user':
+                                mentioned_users.append(mention.get('userId'))
+                    
+                    if not mentioned_users:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 請使用 @ 標記要設為管理員的人"
+                        })
+                        continue
+                    
+                    try:
+                        months = int(parts[-1])
+                        if months < 1 or months > 12:
+                            raise ValueError
+                    except:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 月份必須是 1-12 之間的數字"
+                        })
+                        continue
+                    
+                    tenant_user_id = mentioned_users[0]
+                    token, expires_at = create_tenant(tenant_user_id, months)
+                    add_group_to_tenant(tenant_user_id, group_id)
+                    
+                    # 同時設為群組管理員
                     data.setdefault('group_admin', {})
-                    data['group_admin'][group_id] = new_admin
+                    data['group_admin'][group_id] = tenant_user_id
                     save_data()
+                    
+                    expire_date = expires_at.split('T')[0]
                     reply(event['replyToken'], {
                         "type": "text",
-                        "text": f"✅ 已將本群暫時管理員更換為 {new_admin[-5:]}"
+                        "text": f"✅ 已設定租戶管理員！\n\n👤 管理員：{tenant_user_id[-8:]}\n📅 有效期：{months} 個月\n⏰ 到期日：{expire_date}\n🔑 TOKEN: {token[:8]}..."
                     })
                 else:
                     reply(event['replyToken'], {
                         "type": "text",
-                        "text": "❌ 格式錯誤，請使用 `/換管理員 [USER_ID]`"
+                        "text": "❌ 格式錯誤，請使用：`/設定管理員 @某人 [1-12]`"
                     })
                 continue
 
@@ -1092,85 +1160,34 @@ def webhook():
                     })
                 continue
 
-            # --- 功能管理指令（僅主人可用） ---
-            if lower in ['/功能設定', '/features']:
+            # --- 租戶資訊查詢（主人可用） ---
+            if lower in ['/租戶資訊', '/tenant_info']:
                 if user_id not in MASTER_USER_IDS:
                     reply(event['replyToken'], {
                         "type": "text",
-                        "text": "❌ 只有主人可以設定功能開關喲～"
+                        "text": "❌ 只有主人可以查看租戶資訊喲～"
                     })
                     continue
                 
-                features = get_group_features(group_id)
-                token = get_group_token(group_id)
+                tenant_user_id, tenant = get_tenant_by_group(group_id)
+                if not tenant_user_id:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 本群組尚未設定租戶管理員"
+                    })
+                    continue
                 
-                features_text = '\n'.join([
-                    f"{'✅' if f in features else '❌'} {FEATURE_LIST[f]}" 
-                    for f in FEATURE_LIST.keys()
-                ])
+                token = tenant.get('token', 'N/A')
+                expires_at = tenant.get('expires_at', 'N/A')
+                groups = tenant.get('groups', [])
+                stats = tenant.get('stats', {})
+                is_valid = is_tenant_valid(tenant_user_id)
                 
-                token_text = f"\n\n🔑 群組 TOKEN: {token}" if token else "\n\n🆕 尚未生成 TOKEN"
+                status = "✅ 有效" if is_valid else "❌ 已過期"
                 
                 reply(event['replyToken'], {
                     "type": "text",
-                    "text": f"⚙️ 群組功能狀態\n\n{features_text}{token_text}\n\n💡 使用「/設定功能 [功能名]」來開啟/關閉功能"
-                })
-                continue
-            
-            if lower.startswith('/設定功能 '):
-                if user_id not in MASTER_USER_IDS:
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 只有主人可以設定功能開關喲～"
-                    })
-                    continue
-                
-                parts = text.split()
-                if len(parts) < 2:
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 格式錯誤，請使用：/設定功能 [translate/voice/admin/auto_translate/statistics]"
-                    })
-                    continue
-                
-                feature = parts[1]
-                if feature not in FEATURE_LIST:
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": f"❌ 未知的功能名稱。可用功能：\n" + '\n'.join([f"• {k}: {v}" for k, v in FEATURE_LIST.items()])
-                    })
-                    continue
-                
-                features = get_group_features(group_id)
-                if feature in features:
-                    features.remove(feature)
-                    status = "關閉"
-                else:
-                    features.append(feature)
-                    status = "開啟"
-                
-                token = set_group_features(group_id, features, get_group_token(group_id))
-                
-                reply(event['replyToken'], {
-                    "type": "text",
-                    "text": f"✅ 已{status} {FEATURE_LIST[feature]} 功能！\n\n🔑 群組 TOKEN: {token}"
-                })
-                continue
-            
-            if lower in ['/生成token', '/generate_token']:
-                if user_id not in MASTER_USER_IDS:
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 只有主人可以生成 TOKEN 喲～"
-                    })
-                    continue
-                
-                features = get_group_features(group_id)
-                token = set_group_features(group_id, features)
-                
-                reply(event['replyToken'], {
-                    "type": "text",
-                    "text": f"🎊 已生成新的群組 TOKEN！\n\n🔑 TOKEN: {token}\n\n⚠️ 請妥善保管，此 TOKEN 可用於 API 存取控制"
+                    "text": f"📋 租戶資訊\n\n👤 User ID: {tenant_user_id[-8:]}\n🔑 TOKEN: {token[:12]}...\n📅 到期日: {expires_at.split('T')[0]}\n📊 狀態: {status}\n📊 翻譯次數: {stats.get('translate_count', 0)}\n📝 字元數: {stats.get('char_count', 0)}\n👥 管理群組數: {len(groups)}"
                 })
                 continue
 
@@ -1231,14 +1248,6 @@ def webhook():
 
             # --- 語言選單（中文化，保留舊指令） ---
             if lower in ['/選單', '/menu', 'menu', '翻譯選單', '/翻譯選單']:
-                # 檢查翻譯功能是否開啟
-                if not check_feature_enabled(group_id, "translate"):
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 本群組未開啟翻譯功能，請聯絡管理員。"
-                    })
-                    continue
-                    
                 # 判斷是否已有暫時管理員
                 has_admin = data.get('group_admin', {}).get(group_id) is not None
                 is_privileged = user_id in MASTER_USER_IDS or user_id in data.get(
@@ -1317,32 +1326,41 @@ def webhook():
                 uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m"
                 lang_sets = get_group_stats_for_status()
                 group_count = len(lang_sets)
+                
+                # 取得租戶統計
+                tenant_user_id, tenant = get_tenant_by_group(group_id)
+                if tenant_user_id:
+                    stats = tenant.get('stats', {})
+                    tenant_stats = f"\n\n📋 本群組統計：\n📊 翻譯次數: {stats.get('translate_count', 0)}\n📝 字元數: {stats.get('char_count', 0)}"
+                else:
+                    tenant_stats = ""
+                
                 reply(
                     event['replyToken'], {
                         "type":
                         "text",
                         "text":
-                        f"⏰ 運行時間：{uptime_str}\n📚 翻譯次數：{translate_counter}\n🔠 累積字元：{translate_char_counter}\n👥 群組/用戶數量：{group_count}"
-                    })
-                continue
-            if lower == '/流量':
-                reply(
-                    event['replyToken'], {
-                        "type": "text",
-                        "text": f"🔢 今日翻譯總字元數：{translate_char_counter} 個字元"
+                        f"⏰ 運行時間：{uptime_str}\n👥 群組/用戶數量：{group_count}{tenant_stats}"
                     })
                 continue
             if lower in ['/統計', '翻譯統計']:
-                # 檢查統計功能是否開啟
-                if not check_feature_enabled(group_id, "statistics"):
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 本群組未開啟統計功能，請聯絡管理員。"
-                    })
-                    continue
-                    
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist']:
+                    # 計算所有租戶的統計
+                    tenants = data.get('tenants', {})
+                    total_translate_count = sum(
+                        t.get('stats', {}).get('translate_count', 0) 
+                        for t in tenants.values()
+                    )
+                    total_char_count = sum(
+                        t.get('stats', {}).get('char_count', 0) 
+                        for t in tenants.values()
+                    )
+                    active_tenants = sum(
+                        1 for user_id_t in tenants 
+                        if is_tenant_valid(user_id_t)
+                    )
+                    
                     lang_sets = get_group_stats_for_status()
                     group_count = len(lang_sets)
                     total_langs = sum(len(langs) for langs in lang_sets)
@@ -1352,7 +1370,7 @@ def webhook():
                         all_langs,
                         key=lambda x: sum(1 for langs in lang_sets if x in langs),
                         default="無")
-                    stats = f"📊 群組統計\n\n👥 總群組數：{group_count}\n🌐 平均語言數：{avg_langs:.1f}\n⭐️ 最常用語言：{most_used}\n💬 總翻譯次數：{translate_counter}\n📝 總字元數：{translate_char_counter}"
+                    stats = f"📊 系統統計\n\n👥 總群組數：{group_count}\n🌐 平均語言數：{avg_langs:.1f}\n⭐️ 最常用語言：{most_used}\n\n🎫 租戶統計\n👤 活躍租戶：{active_tenants}\n💬 總翻譯次數：{total_translate_count}\n📝 總字元數：{total_char_count}"
                     reply(event['replyToken'], {"type": "text", "text": stats})
                 else:
                     reply(event['replyToken'], {
@@ -1361,14 +1379,6 @@ def webhook():
                     })
                 continue
             if lower == '語音翻譯':
-                # 檢查語音功能是否開啟
-                if not check_feature_enabled(group_id, "voice"):
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 本群組未開啟語音翻譯功能，請聯絡管理員。"
-                    })
-                    continue
-                    
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist'] or is_group_admin(user_id, group_id):
                     current_status = data['voice_translation'].get(
@@ -1388,14 +1398,6 @@ def webhook():
                 continue
 
             if lower == '自動翻譯':
-                # 檢查自動翻譯功能是否開啟
-                if not check_feature_enabled(group_id, "auto_translate"):
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 本群組未開啟自動翻譯功能，請聯絡管理員。"
-                    })
-                    continue
-                    
                 if user_id in MASTER_USER_IDS or user_id in data[
                         'user_whitelist'] or is_group_admin(user_id, group_id):
                     if 'auto_translate' not in data:
@@ -1432,7 +1434,7 @@ def webhook():
 
             # 檢查是否開啟自動翻譯
             auto_translate = data.get('auto_translate', {}).get(group_id, True)
-            if auto_translate and check_feature_enabled(group_id, "translate"):
+            if auto_translate:
                 langs = get_group_langs(group_id)
 
                 # 依群組設定決定翻譯引擎先後順序（預設 Google 優先）
@@ -1444,17 +1446,10 @@ def webhook():
                 threading.Thread(
                     target=_async_translate_and_reply,
                     args=(event['replyToken'], text, list(langs),
-                          prefer_deepl_first),
+                          prefer_deepl_first, group_id),
                     daemon=True).start()
                 continue
             elif text.startswith('!翻譯'):  # 手動翻譯指令
-                if not check_feature_enabled(group_id, "translate"):
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": "❌ 本群組未開啟翻譯功能，請聯絡管理員。"
-                    })
-                    continue
-                    
                 text_to_translate = text[3:].strip()
                 if text_to_translate:
                     langs = get_group_langs(group_id)
@@ -1465,7 +1460,7 @@ def webhook():
                     threading.Thread(
                         target=_async_translate_and_reply,
                         args=(event['replyToken'], text_to_translate,
-                              list(langs), prefer_deepl_first),
+                              list(langs), prefer_deepl_first, group_id),
                         daemon=True).start()
                     continue
     return 'OK'
