@@ -853,16 +853,16 @@ def _translate_with_google(text, target_lang):
         'dt': 't',
         'q': text,
     }
-    # 增加 timeout 至 5 秒，加上重試機制與 exponential backoff
-    max_retries = 3
+    # timeout 2.5 秒，最多重試 1 次
+    max_retries = 2  # 1 次原始請求 + 1 次重試
     for attempt in range(1, max_retries + 1):
         try:
-            res = requests.get(url, params=params, timeout=5)
+            res = requests.get(url, params=params, timeout=2.5)
         except requests.RequestException as e:
             print(f"❌ Google 翻譯請求錯誤 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.5 * attempt)  # exponential backoff: 0.5s, 1s, 1.5s
+            time.sleep(0.3)  # 重試前等待 0.3 秒
             continue
 
         if res.status_code != 200:
@@ -870,7 +870,7 @@ def _translate_with_google(text, target_lang):
             print(f"❌ Google 翻譯狀態碼 {res.status_code} (第 {attempt} 次)，回應：{preview}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.5 * attempt)
+            time.sleep(0.3)
             continue
 
         try:
@@ -879,7 +879,7 @@ def _translate_with_google(text, target_lang):
             print(f"❌ 解析 Google 翻譯回應失敗 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.5 * attempt)
+            time.sleep(0.3)
             continue
 
     return None
