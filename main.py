@@ -319,7 +319,7 @@ def get_group_langs(group_id):
     langs = _load_group_langs_from_db(group_id)
     if langs is not None:
         return langs
-    return data.get('user_prefs', {}).get(group_id, {'en'})
+    return data.get('user_prefs', {}).get(group_id, {'zh-TW'})  # 預設使用繁體中文
 
 
 def set_group_langs(group_id, langs):
@@ -1003,17 +1003,28 @@ def _translate_with_google(text, target_lang):
 def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
     """
     統一翻譯入口。翻譯策略：
-    1. 優先嘗試 DeepL
-    2. 若 DeepL 回傳「不支援該語言」-> 直接用 Google（不算失敗）
-    3. 若 DeepL 真正失敗（timeout/HTTP error）-> fallback 到 Google
-    4. DeepL 和 Google 都失敗 -> 回傳錯誤訊息
+    1. 優先嘗試 Google
+    2. 若 Google 失敗 -> fallback 到 DeepL
+    3. Google 和 DeepL 都失敗 -> 回傳錯誤訊息
     """
 
     # 如果是純數字、純符號或空白，直接返回原文
     if not text or text.strip().replace(' ', '').replace('.', '').replace(',', '').isdigit():
         return text
 
-    # 1. 優先嘗試 DeepL
+    # 1. 優先嘗試 Google
+    translated, google_reason = _translate_with_google(text, target_lang)
+    
+    if translated:
+        # Google 成功
+        if group_id:
+            user_id, tenant = get_tenant_by_group(group_id)
+            if user_id:
+                update_tenant_stats(user_id, translate_count=1, char_count=len(text))
+        return translated
+    
+    # 2. Google 失敗，嘗試 DeepL fallback
+    print(f"⚠️ [翻譯] Google 失敗 ({google_reason})，嘗試 DeepL fallback，語言: {target_lang}")
     translated, deepl_reason = _translate_with_deepl(text, target_lang)
     
     if translated:
@@ -1024,37 +1035,12 @@ def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
                 update_tenant_stats(user_id, translate_count=1, char_count=len(text))
         return translated
     
-    # 2. DeepL 未成功，判斷原因
-    if deepl_reason in ('unsupported_language', 'no_api_key'):
-        # 不支援的語言或無 API Key，直接用 Google（不印錯誤）
-        if deepl_reason == 'unsupported_language':
-            print(f"ℹ️ [翻譯] DeepL 不支援 {target_lang}，使用 Google")
-        
-        translated_google, google_reason = _translate_with_google(text, target_lang)
-        if translated_google:
-            if group_id:
-                user_id, tenant = get_tenant_by_group(group_id)
-                if user_id:
-                    update_tenant_stats(user_id, translate_count=1, char_count=len(text))
-            return translated_google
-        else:
-            # Google 也失敗
-            print(f"⚠️ [翻譯] Google 失敗 ({google_reason})，語言: {target_lang}")
-            return "翻譯暫時失敗，請稍後再試"
+    # 3. DeepL 也失敗，判斷原因
+    if deepl_reason == 'unsupported_language':
+        print(f"ℹ️ [翻譯] DeepL 也不支援 {target_lang}")
     
-    # 3. DeepL 真正失敗（timeout/HTTP error 等），嘗試 Google fallback
-    print(f"⚠️ [翻譯] DeepL 失敗 ({deepl_reason})，嘗試 Google fallback，語言: {target_lang}")
-    translated_google, google_reason = _translate_with_google(text, target_lang)
-    
-    if translated_google:
-        if group_id:
-            user_id, tenant = get_tenant_by_group(group_id)
-            if user_id:
-                update_tenant_stats(user_id, translate_count=1, char_count=len(text))
-        return translated_google
-    
-    # 4. DeepL 和 Google 都失敗
-    print(f"❌ [翻譯] DeepL ({deepl_reason}) 和 Google ({google_reason}) 都失敗，語言: {target_lang}")
+    # 4. Google 和 DeepL 都失敗
+    print(f"❌ [翻譯] Google ({google_reason}) 和 DeepL ({deepl_reason}) 都失敗，語言: {target_lang}")
     return "翻譯暫時失敗，請稍後再試"
 
 
