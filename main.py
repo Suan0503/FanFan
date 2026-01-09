@@ -6,11 +6,11 @@ import json
 import time
 import threading
 from datetime import datetime, timedelta
+from flask_sqlalchemy import SQLAlchemy
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextSendMessage
 from dotenv import load_dotenv
 
-# 先創建 app
 app = Flask(__name__)
 
 # 載入 .env 檔（若存在），讓本機開發也能讀到 DEEPL_API_KEY 等設定
@@ -21,20 +21,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# 設定資料庫 URI
+db = None
 if DATABASE_URL:
     app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-else:
-    # 本地開發使用 SQLite
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///fanfan.db"
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-# 引入資料庫模型
-from models import db, Tenant, Group, UserPreference, GroupAdmin, Whitelist
-
-# 初始化資料庫
-db.init_app(app)
+    db = SQLAlchemy(app)
 
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
@@ -119,199 +110,141 @@ def save_data():
 load_data()
 
 
-# ===== 資料庫輔助函數 =====
+# --- 群組翻譯設定（資料庫 + 舊 data.json 並存） ---
+if db:
+    class GroupTranslateSetting(db.Model):  # type: ignore[misc]
+        """群組翻譯設定：每個群組選擇的目標語言清單。"""
 
-def migrate_json_to_db():
-    """將 data.json 的資料遷移到資料庫"""
-    print("🔄 開始遷移 data.json 到資料庫...")
-    
+        __tablename__ = "group_translate_setting"
+
+        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+        group_id = db.Column(db.String(255), unique=True, nullable=False)
+        # 以逗號分隔的語言代碼，例如："en,zh-TW,ja"
+        languages = db.Column(db.String(255), nullable=False, default="en")
+        created_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               nullable=False)
+        updated_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               onupdate=datetime.utcnow,
+                               nullable=False)
+
+    class GroupActivity(db.Model):  # type: ignore[misc]
+        """紀錄群組最後活躍時間，用來判斷是否自動退出群組。"""
+
+        __tablename__ = "group_activity"
+
+        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+        group_id = db.Column(db.String(255), unique=True, nullable=False)
+        last_active_at = db.Column(db.DateTime,
+                                   default=datetime.utcnow,
+                                   nullable=False)
+
+    class GroupEnginePreference(db.Model):  # type: ignore[misc]
+        """每個群組的翻譯引擎偏好（google / deepl）。"""
+
+        __tablename__ = "group_engine_preference"
+
+        id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+        group_id = db.Column(db.String(255), unique=True, nullable=False)
+        engine = db.Column(db.String(20), nullable=False, default="google")
+        created_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               nullable=False)
+        updated_at = db.Column(db.DateTime,
+                               default=datetime.utcnow,
+                               onupdate=datetime.utcnow,
+                               nullable=False)
+
+
     with app.app_context():
-        # 1. 遷移白名單
-        for user_id in data.get('user_whitelist', []):
-            if not Whitelist.query.filter_by(user_id=user_id).first():
-                db.session.add(Whitelist(user_id=user_id))
-        
-        # 2. 遷移租戶
-        tenants_data = data.get('tenants', {})
-        for user_id, tenant_info in tenants_data.items():
-            existing = Tenant.query.filter_by(user_id=user_id).first()
-            if not existing:
-                tenant = Tenant(
-                    user_id=user_id,
-                    token=tenant_info.get('token', ''),
-                    expires_at=datetime.fromisoformat(tenant_info.get('expires_at', '2026-01-01')),
-                    translate_count=tenant_info.get('stats', {}).get('translate_count', 0),
-                    char_count=tenant_info.get('stats', {}).get('char_count', 0)
-                )
-                db.session.add(tenant)
-                db.session.flush()  # 獲取 tenant.id
-                
-                # 3. 遷移該租戶的群組
-                for group_id in tenant_info.get('groups', []):
-                    if not Group.query.filter_by(group_id=group_id).first():
-                        group = Group(
-                            group_id=group_id,
-                            tenant_id=tenant.id,
-                            auto_translate=data.get('auto_translate', {}).get(group_id, True),
-                            voice_translation=data.get('voice_translation', {}).get(group_id, True),
-                            engine_pref=data.get('translate_engine_pref', {}).get(group_id, 'google')
-                        )
-                        db.session.add(group)
-                        db.session.flush()
-                        
-                        # 4. 遷移用戶語言偏好
-                        for uid, langs in data.get('user_prefs', {}).items():
-                            if uid.startswith(group_id):  # user_prefs 格式: {group_id: [langs]}
-                                if not UserPreference.query.filter_by(group_id=group.id, user_id=uid).first():
-                                    lang_list = list(langs) if isinstance(langs, set) else langs
-                                    db.session.add(UserPreference(
-                                        group_id=group.id,
-                                        user_id=uid,
-                                        languages=lang_list
-                                    ))
-        
-        # 5. 遷移群組管理員
-        for group_id, admin_user_id in data.get('group_admin', {}).items():
-            group = Group.query.filter_by(group_id=group_id).first()
-            if group and admin_user_id:
-                if not GroupAdmin.query.filter_by(group_id=group.id, user_id=admin_user_id).first():
-                    db.session.add(GroupAdmin(group_id=group.id, user_id=admin_user_id))
-        
-        db.session.commit()
-        print("✅ 資料遷移完成！")
+        db.create_all()
 
-
-def get_or_create_tenant(user_id, token=None, months=1):
-    """取得或建立租戶"""
-    tenant = Tenant.query.filter_by(user_id=user_id).first()
-    if not tenant and token:
-        expires_at = datetime.utcnow() + timedelta(days=30 * months)
-        tenant = Tenant(user_id=user_id, token=token, expires_at=expires_at)
-        db.session.add(tenant)
-        db.session.commit()
-    return tenant
-
-
-def get_tenant_by_group(group_id):
-    """透過群組ID查詢租戶"""
-    group = Group.query.filter_by(group_id=group_id).first()
-    if group:
-        return group.tenant
-    return None
-
-
-def is_user_admin(user_id):
-    """檢查是否為管理員（MASTER或白名單）"""
-    return user_id in MASTER_USER_IDS or Whitelist.query.filter_by(user_id=user_id).first() is not None
-
-
-def is_group_temp_admin(user_id, group_id):
-    """檢查是否為群組臨時管理員"""
-    group = Group.query.filter_by(group_id=group_id).first()
-    if group:
-        return GroupAdmin.query.filter_by(group_id=group.id, user_id=user_id).first() is not None
-    return False
-
-
-def check_expiration_and_remind():
-    """檢查所有租戶到期狀態並發送提醒"""
-    with app.app_context():
-        tenants = Tenant.query.filter_by(is_active=True).all()
-        
-        for tenant in tenants:
-            # 到期自動降級
-            if tenant.is_expired() and tenant.plan != 'free':
-                tenant.plan = 'free'
-                db.session.commit()
-                
-                # 發送到期通知
-                try:
-                    line_bot_api.push_message(
-                        tenant.user_id,
-                        TextSendMessage(text=f"⚠️ 您的訂閱已到期，已自動降級為免費版。\n如需繼續使用付費功能，請聯繫管理員續費。")
-                    )
-                except Exception as e:
-                    print(f"❌ 發送到期通知失敗: {e}")
-            
-            # 7天提醒
-            elif tenant.should_remind_7days():
-                tenant.reminded_7days = True
-                db.session.commit()
-                try:
-                    line_bot_api.push_message(
-                        tenant.user_id,
-                        TextSendMessage(text=f"⏰ 提醒：您的訂閱將在 7 天後到期（{tenant.expires_at.strftime('%Y-%m-%d')}）\n請及時續費以繼續使用付費功能。")
-                    )
-                except Exception as e:
-                    print(f"❌ 發送7天提醒失敗: {e}")
-            
-            # 1天提醒
-            elif tenant.should_remind_1day():
-                tenant.reminded_1day = True
-                db.session.commit()
-                try:
-                    line_bot_api.push_message(
-                        tenant.user_id,
-                        TextSendMessage(text=f"🚨 緊急提醒：您的訂閱將在 1 天後到期（{tenant.expires_at.strftime('%Y-%m-%d')}）\n請盡快續費！")
-                    )
-                except Exception as e:
-                    print(f"❌ 發送1天提醒失敗: {e}")
-
-
-# 初始化資料庫並遷移資料
-with app.app_context():
-    db.create_all()
-    print("✅ 資料表已建立")
-    
-    # 首次啟動時遷移資料
-    if Tenant.query.count() == 0 and data.get('tenants'):
-        migrate_json_to_db()
-
-
-# 啟動定時檢查任務（每天檢查一次）
-def schedule_expiration_check():
-    """定時檢查到期並提醒"""
-    while True:
-        time.sleep(86400)  # 每24小時執行一次
+        # 啟動時，嘗試將舊的 data.json 內 user_prefs 同步到資料庫
         try:
-            check_expiration_and_remind()
+            user_prefs = data.get("user_prefs", {})
+            migrated_count = 0
+            activity_count = 0
+            for group_id, langs in user_prefs.items():
+                if not group_id:
+                    continue
+
+                # 統一轉成集合後再轉字串
+                if isinstance(langs, (list, set)):
+                    lang_set = {str(c).strip() for c in langs if c}
+                else:
+                    continue
+
+                lang_str = ",".join(sorted(lang_set))
+
+                setting = GroupTranslateSetting.query.filter_by(
+                    group_id=group_id).first()
+                if not setting:
+                    setting = GroupTranslateSetting(group_id=group_id,
+                                                   languages=lang_str)
+                    db.session.add(setting)
+                    migrated_count += 1
+                else:
+                    # 若資料庫本來就沒寫入 languages，補上一次即可
+                    if not setting.languages:
+                        setting.languages = lang_str
+                        migrated_count += 1
+
+                # 確保已有翻譯設定的群組，同步建立 GroupActivity，
+                # 讓舊群組從「現在」開始重新計算 20 天未使用。
+                activity = GroupActivity.query.filter_by(
+                    group_id=group_id).first()
+                if not activity:
+                    activity = GroupActivity(group_id=group_id,
+                                             last_active_at=datetime.utcnow())
+                    db.session.add(activity)
+                    activity_count += 1
+
+            if migrated_count or activity_count:
+                db.session.commit()
+                print(f"✅ 已將 {migrated_count} 組舊翻譯設定同步到資料庫，並為 {activity_count} 個群組建立活躍記錄")
         except Exception as e:
-            print(f"❌ 定時檢查失敗: {e}")
+            db.session.rollback()
+            print(f"❌ 同步舊翻譯設定到資料庫失敗: {e}")
 
-# 啟動背景執行緒
-threading.Thread(target=schedule_expiration_check, daemon=True).start()
-print("✅ 定時檢查任務已啟動")
+        # 啟動時，將舊的 data.json 內 translate_engine_pref 同步到資料庫
+        try:
+            engine_prefs = data.get("translate_engine_pref", {})
+            migrated_engine_count = 0
+            for group_id, engine in engine_prefs.items():
+                if not group_id:
+                    continue
+                if engine not in ("google", "deepl"):
+                    continue
 
+                pref = GroupEnginePreference.query.filter_by(
+                    group_id=group_id).first()
+                if not pref:
+                    pref = GroupEnginePreference(group_id=group_id,
+                                                 engine=engine)
+                    db.session.add(pref)
+                    migrated_engine_count += 1
+                else:
+                    if pref.engine != engine:
+                        pref.engine = engine
+                        migrated_engine_count += 1
 
-# --- 保留舊的 GroupTranslateSetting等模型用於相容性 ---
-class GroupTranslateSetting(db.Model):
-    """群組翻譯設定：每個群組選擇的目標語言清單。"""
-    __tablename__ = "group_translate_setting"
-    
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    group_id = db.Column(db.String(255), unique=True, nullable=False)
-    languages = db.Column(db.String(255), nullable=False, default="en")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+            if migrated_engine_count:
+                db.session.commit()
+                print(f"✅ 已將 {migrated_engine_count} 組引擎偏好同步到資料庫")
+        except Exception as e:
+            db.session.rollback()
+            print(f"❌ 同步引擎偏好到資料庫失敗: {e}")
+else:
+    # 沒有設定資料庫時提供一個空的 placeholder 類別，避免型別檢查錯誤
+    class GroupTranslateSetting:  # type: ignore[misc]
+        pass
 
-class GroupActivity(db.Model):
-    """紀錄群組最後活躍時間，用來判斷是否自動退出群組。"""
-    __tablename__ = "group_activity"
-    
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    group_id = db.Column(db.String(255), unique=True, nullable=False)
-    last_active_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    class GroupActivity:  # type: ignore[misc]
+        pass
 
-class GroupEnginePreference(db.Model):
-    """每個群組的翻譯引擎偏好（google / deepl）。"""
-    __tablename__ = "group_engine_preference"
-    
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    group_id = db.Column(db.String(255), unique=True, nullable=False)
-    engine = db.Column(db.String(20), nullable=False, default="google")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-
+    class GroupEnginePreference:  # type: ignore[misc]
+        pass
 
 
 def _load_group_langs_from_db(group_id):
@@ -554,93 +487,82 @@ LANGUAGE_MAP = {
     '🇷🇺 俄文': 'ru'
 }
 
-# --- 租戶管理系統（使用資料庫）---
+# --- 租戶管理系統 ---
 def generate_tenant_token():
     """生成唯一的租戶 TOKEN"""
     import secrets
     return secrets.token_urlsafe(16)
 
-def create_tenant_db(user_id, months=1):
-    """創建租戶訂閱（資料庫版本）"""
-    with app.app_context():
-        token = generate_tenant_token()
-        expires_at = datetime.utcnow() + timedelta(days=30 * months)
-        
-        tenant = Tenant.query.filter_by(user_id=user_id).first()
-        if tenant:
-            # 更新現有租戶
-            tenant.token = token
-            tenant.expires_at = expires_at
-            tenant.is_active = True
-            tenant.plan = 'premium'
-            tenant.reminded_7days = False
-            tenant.reminded_1day = False
-        else:
-            # 創建新租戶
-            tenant = Tenant(
-                user_id=user_id,
-                token=token,
-                expires_at=expires_at,
-                plan='premium'
-            )
-            db.session.add(tenant)
-        
-        db.session.commit()
-        return token, expires_at.isoformat()
+def create_tenant(user_id, months=1):
+    """創建租戶訂閱"""
+    token = generate_tenant_token()
+    expires_at = (datetime.utcnow() + timedelta(days=30 * months)).isoformat()
+    
+    data.setdefault("tenants", {})
+    data["tenants"][user_id] = {
+        "token": token,
+        "expires_at": expires_at,
+        "groups": [],
+        "stats": {
+            "translate_count": 0,
+            "char_count": 0
+        },
+        "created_at": datetime.utcnow().isoformat()
+    }
+    save_data()
+    return token, expires_at
 
-def get_tenant_by_group_db(group_id):
-    """根據群組ID取得租戶（資料庫版本）"""
-    with app.app_context():
-        group = Group.query.filter_by(group_id=group_id).first()
-        if group:
-            return group.tenant
-        return None
+def get_tenant_by_group(group_id):
+    """根據群組ID取得租戶"""
+    tenants = data.get("tenants", {})
+    for user_id, tenant in tenants.items():
+        if group_id in tenant.get("groups", []):
+            return user_id, tenant
+    return None, None
 
-def is_tenant_valid_db(user_id):
-    """檢查租戶是否有效（資料庫版本）"""
-    with app.app_context():
-        tenant = Tenant.query.filter_by(user_id=user_id).first()
-        if not tenant:
-            return False
-        return not tenant.is_expired() and tenant.is_active
+def is_tenant_valid(user_id):
+    """檢查租戶是否有效（未過期）"""
+    tenants = data.get("tenants", {})
+    if user_id not in tenants:
+        return False
+    
+    expires_at = tenants[user_id].get("expires_at")
+    if not expires_at:
+        return False
+    
+    try:
+        expire_dt = datetime.fromisoformat(expires_at)
+        return datetime.utcnow() < expire_dt
+    except:
+        return False
 
-def add_group_to_tenant_db(user_id, group_id):
-    """將群組加入租戶管理（資料庫版本）"""
-    with app.app_context():
-        tenant = Tenant.query.filter_by(user_id=user_id).first()
-        if not tenant:
-            return False
-        
-        # 檢查群組是否已存在
-        existing_group = Group.query.filter_by(group_id=group_id).first()
-        if existing_group:
-            # 更新為新租戶
-            existing_group.tenant_id = tenant.id
-        else:
-            # 創建新群組
-            group = Group(group_id=group_id, tenant_id=tenant.id)
-            db.session.add(group)
-        
-        db.session.commit()
-        return True
+def add_group_to_tenant(user_id, group_id):
+    """將群組加入租戶管理"""
+    tenants = data.get("tenants", {})
+    if user_id not in tenants:
+        return False
+    
+    if group_id not in tenants[user_id].get("groups", []):
+        tenants[user_id].setdefault("groups", []).append(group_id)
+        save_data()
+    return True
 
-def update_tenant_stats_db(user_id, translate_count=0, char_count=0):
-    """更新租戶統計資料（資料庫版本）"""
-    with app.app_context():
-        tenant = Tenant.query.filter_by(user_id=user_id).first()
-        if tenant:
-            tenant.translate_count += translate_count
-            tenant.char_count += char_count
-            db.session.commit()
+def update_tenant_stats(user_id, translate_count=0, char_count=0):
+    """更新租戶統計資料"""
+    tenants = data.get("tenants", {})
+    if user_id in tenants:
+        stats = tenants[user_id].setdefault("stats", {"translate_count": 0, "char_count": 0})
+        stats["translate_count"] = stats.get("translate_count", 0) + translate_count
+        stats["char_count"] = stats.get("char_count", 0) + char_count
+        save_data()
 
-def check_group_access_db(group_id):
-    """檢查群組是否有有效的租戶訂閱（資料庫版本）"""
-    with app.app_context():
-        tenant = get_tenant_by_group_db(group_id)
-        if tenant:
-            return not tenant.is_expired() and tenant.is_active
-        # 預設：未設定租戶的群組全功能開放
-        return True
+def check_group_access(group_id):
+    """檢查群組是否有有效的租戶訂閱（預設全開放）"""
+    user_id, tenant = get_tenant_by_group(group_id)
+    if user_id:
+        return is_tenant_valid(user_id)
+    # 預設：未設定租戶的群組全功能開放
+    return True
 
 def create_command_menu():
     """創建新年風格指令選單"""
@@ -975,12 +897,11 @@ def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
     if translated is None:
         return "翻譯失敗QQ"
 
-    # 更新 per-tenant 統計（使用資料庫）
+    # 更新 per-tenant 統計
     if group_id:
-        with app.app_context():
-            tenant = get_tenant_by_group_db(group_id)
-            if tenant:
-                update_tenant_stats_db(tenant.user_id, translate_count=1, char_count=len(text))
+        user_id, tenant = get_tenant_by_group(group_id)
+        if user_id:
+            update_tenant_stats(user_id, translate_count=1, char_count=len(text))
     
     return translated
 
@@ -1164,7 +1085,7 @@ def webhook():
                         })
                 continue
 
-            # --- 主人設定租戶管理員（使用資料庫）---
+            # --- 主人設定租戶管理員 ---
             if (lower.startswith('/設定管理員') or lower.startswith('設定管理員')) and user_id in MASTER_USER_IDS:
                 parts = text.replace('　', ' ').split()
                 # 格式: /設定管理員 @某人 [1-12]
@@ -1198,29 +1119,18 @@ def webhook():
                         continue
                     
                     tenant_user_id = mentioned_users[0]
+                    token, expires_at = create_tenant(tenant_user_id, months)
+                    add_group_to_tenant(tenant_user_id, group_id)
                     
-                    # 使用資料庫創建租戶
-                    with app.app_context():
-                        token, expires_at = create_tenant_db(tenant_user_id, months)
-                        add_group_to_tenant_db(tenant_user_id, group_id)
-                        
-                        # 同時設為群組管理員
-                        group = Group.query.filter_by(group_id=group_id).first()
-                        if group:
-                            existing_admin = GroupAdmin.query.filter_by(
-                                group_id=group.id, user_id=tenant_user_id
-                            ).first()
-                            if not existing_admin:
-                                db.session.add(GroupAdmin(
-                                    group_id=group.id,
-                                    user_id=tenant_user_id
-                                ))
-                                db.session.commit()
+                    # 同時設為群組管理員
+                    data.setdefault('group_admin', {})
+                    data['group_admin'][group_id] = tenant_user_id
+                    save_data()
                     
                     expire_date = expires_at.split('T')[0]
                     reply(event['replyToken'], {
                         "type": "text",
-                        "text": f"✅ 已設定租戶管理員！\n\n👤 管理員：{tenant_user_id[-8:]}\n📅 有效期：{months} 個月\n⏰ 到期日：{expire_date}\n🔑 TOKEN: {token[:8]}...\n\n💡 提示：管理員可使用 /付費選單 查看詳情"
+                        "text": f"✅ 已設定租戶管理員！\n\n👤 管理員：{tenant_user_id[-8:]}\n📅 有效期：{months} 個月\n⏰ 到期日：{expire_date}\n🔑 TOKEN: {token[:8]}..."
                     })
                 else:
                     reply(event['replyToken'], {
@@ -1250,111 +1160,6 @@ def webhook():
                     })
                 continue
 
-            # --- 管理員選單（MASTER/白名單可用） ---
-            if lower in ['/管理員選單', '/admin_menu']:
-                if user_id not in MASTER_USER_IDS:
-                    if not Whitelist.query.filter_by(user_id=user_id).first():
-                        reply(event['replyToken'], {
-                            "type": "text",
-                            "text": "❌ 只有管理員可以使用此功能喲～"
-                        })
-                        continue
-                
-                # 獲取所有租戶資訊
-                with app.app_context():
-                    all_tenants = Tenant.query.all()
-                    active_count = sum(1 for t in all_tenants if not t.is_expired())
-                    total_groups = Group.query.count()
-                    
-                    tenant_list = []
-                    for tenant in all_tenants[:10]:  # 顯示前10個
-                        status = "✅" if not tenant.is_expired() else "❌"
-                        groups_count = len(tenant.groups)
-                        tenant_list.append(
-                            f"{status} {tenant.user_id[-8:]} | {tenant.plan.upper()} | "
-                            f"到期:{tenant.expires_at.strftime('%Y-%m-%d')} | "
-                            f"群組:{groups_count} | "
-                            f"翻譯:{tenant.translate_count}次"
-                        )
-                    
-                    tenant_text = "\n".join(tenant_list) if tenant_list else "無租戶資料"
-                    
-                    menu_text = f"""🎛️ 管理員控制面板
-
-📊 系統統計
-👥 總租戶數: {len(all_tenants)}
-✅ 活躍租戶: {active_count}
-🏢 總群組數: {total_groups}
-
-📋 租戶列表（最近10筆）
-{tenant_text}
-
-💡 管理指令
-/設定管理員 @用戶 [月數] - 新增租戶
-/租戶資訊 - 查看當前群組租戶
-/統計 - 查看系統統計
-/白名單 add [user_id] - 加入白名單
-/白名單 list - 查看白名單"""
-                    
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": menu_text
-                    })
-                continue
-
-            # --- 付費選單（付費用戶專用） ---
-            if lower in ['/付費選單', '/premium_menu', '/我的選單']:
-                with app.app_context():
-                    tenant = Tenant.query.filter_by(user_id=user_id).first()
-                    
-                    if not tenant or tenant.is_expired():
-                        reply(event['replyToken'], {
-                            "type": "text",
-                            "text": "❌ 此功能僅限付費用戶使用\n\n您的訂閱已到期或尚未訂閱\n請聯繫管理員續費或開通服務"
-                        })
-                        continue
-                    
-                    # 計算剩餘天數
-                    days_left = tenant.days_remaining()
-                    
-                    # 獲取管理的群組
-                    groups_count = len(tenant.groups)
-                    
-                    menu_text = f"""💎 付費用戶選單
-
-👤 訂閱資訊
-📅 到期日: {tenant.expires_at.strftime('%Y-%m-%d')}
-⏰ 剩餘天數: {days_left} 天
-📦 方案: {tenant.plan.upper()}
-🏢 管理群組數: {groups_count}
-
-📊 使用統計
-💬 翻譯次數: {tenant.translate_count:,}
-📝 翻譯字元: {tenant.char_count:,}
-
-🎯 可用功能
-✅ 多語言翻譯（無限制）
-✅ 語音訊息翻譯
-✅ 自動翻譯
-✅ 群組管理（最多20個）
-✅ 翻譯引擎切換（Google/DeepL）
-✅ 即時統計
-
-💡 管理指令
-/選單 - 設定翻譯語言
-/語音翻譯 - 切換語音翻譯
-/引擎 - 切換翻譯引擎
-/自動翻譯 - 切換自動翻譯
-
-⚠️ 到期後將自動降級為免費版
-免費版功能受限，請及時續費"""
-                    
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": menu_text
-                    })
-                continue
-
             # --- 租戶資訊查詢（主人可用） ---
             if lower in ['/租戶資訊', '/tenant_info']:
                 if user_id not in MASTER_USER_IDS:
@@ -1364,23 +1169,26 @@ def webhook():
                     })
                     continue
                 
-                with app.app_context():
-                    tenant = get_tenant_by_group_db(group_id)
-                    if not tenant:
-                        reply(event['replyToken'], {
-                            "type": "text",
-                            "text": "❌ 本群組尚未設定租戶管理員"
-                        })
-                        continue
-                    
-                    is_valid = not tenant.is_expired()
-                    status = "✅ 有效" if is_valid else "❌ 已過期"
-                    groups_count = len(tenant.groups)
-                    
+                tenant_user_id, tenant = get_tenant_by_group(group_id)
+                if not tenant_user_id:
                     reply(event['replyToken'], {
                         "type": "text",
-                        "text": f"📋 租戶資訊\n\n👤 User ID: {tenant.user_id[-8:]}\n🔑 TOKEN: {tenant.token[:12]}...\n📅 到期日: {tenant.expires_at.strftime('%Y-%m-%d')}\n⏰ 剩餘: {tenant.days_remaining()}天\n📊 狀態: {status}\n📦 方案: {tenant.plan.upper()}\n💬 翻譯次數: {tenant.translate_count}\n📝 字元數: {tenant.char_count}\n👥 管理群組數: {groups_count}"
+                        "text": "❌ 本群組尚未設定租戶管理員"
                     })
+                    continue
+                
+                token = tenant.get('token', 'N/A')
+                expires_at = tenant.get('expires_at', 'N/A')
+                groups = tenant.get('groups', [])
+                stats = tenant.get('stats', {})
+                is_valid = is_tenant_valid(tenant_user_id)
+                
+                status = "✅ 有效" if is_valid else "❌ 已過期"
+                
+                reply(event['replyToken'], {
+                    "type": "text",
+                    "text": f"📋 租戶資訊\n\n👤 User ID: {tenant_user_id[-8:]}\n🔑 TOKEN: {token[:12]}...\n📅 到期日: {expires_at.split('T')[0]}\n📊 狀態: {status}\n� 翻譯次數: {stats.get('translate_count', 0)}\n📝 字元數: {stats.get('char_count', 0)}\n👥 管理群組數: {len(groups)}"
+                })
                 continue
 
             # 只有主人可以用系統管理（指令權限不變）
@@ -1536,14 +1344,22 @@ def webhook():
                     })
                 continue
             if lower in ['/統計', '翻譯統計']:
-                if user_id in MASTER_USER_IDS or Whitelist.query.filter_by(user_id=user_id).first():
-                    # 計算所有租戶的統計（從資料庫）
-                    with app.app_context():
-                        all_tenants = Tenant.query.all()
-                        total_translate_count = sum(t.translate_count for t in all_tenants)
-                        total_char_count = sum(t.char_count for t in all_tenants)
-                        active_tenants = sum(1 for t in all_tenants if not t.is_expired())
-                        total_groups = Group.query.count()
+                if user_id in MASTER_USER_IDS or user_id in data[
+                        'user_whitelist']:
+                    # 計算所有租戶的統計
+                    tenants = data.get('tenants', {})
+                    total_translate_count = sum(
+                        t.get('stats', {}).get('translate_count', 0) 
+                        for t in tenants.values()
+                    )
+                    total_char_count = sum(
+                        t.get('stats', {}).get('char_count', 0) 
+                        for t in tenants.values()
+                    )
+                    active_tenants = sum(
+                        1 for user_id_t in tenants 
+                        if is_tenant_valid(user_id_t)
+                    )
                     
                     lang_sets = get_group_stats_for_status()
                     group_count = len(lang_sets)
@@ -1554,7 +1370,7 @@ def webhook():
                         all_langs,
                         key=lambda x: sum(1 for langs in lang_sets if x in langs),
                         default="無")
-                    stats = f"📊 系統統計\n\n👥 總群組數：{total_groups}\n🌐 平均語言數：{avg_langs:.1f}\n⭐️ 最常用語言：{most_used}\n\n🎫 租戶統計\n👤 活躍租戶：{active_tenants}\n💬 總翻譯次數：{total_translate_count:,}\n📝 總字元數：{total_char_count:,}"
+                    stats = f"📊 系統統計\n\n👥 總群組數：{group_count}\n🌐 平均語言數：{avg_langs:.1f}\n⭐️ 最常用語言：{most_used}\n\n🎫 租戶統計\n👤 活躍租戶：{active_tenants}\n💬 總翻譯次數：{total_translate_count}\n📝 總字元數：{total_char_count}"
                     reply(event['replyToken'], {"type": "text", "text": stats})
                 else:
                     reply(event['replyToken'], {
