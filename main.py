@@ -10,8 +10,15 @@ from flask_sqlalchemy import SQLAlchemy
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextSendMessage
 from dotenv import load_dotenv
+import hmac
+import hashlib
+import base64
 
 app = Flask(__name__)
+
+# 翻譯執行緒限制 - 防止過多並發翻譯導致系統卡死
+MAX_CONCURRENT_TRANSLATIONS = 4
+translation_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
 
 # 載入 .env 檔（若存在），讓本機開發也能讀到 DEEPL_API_KEY 等設定
 load_dotenv()
@@ -29,6 +36,7 @@ if DATABASE_URL:
 
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
+CHANNEL_SECRET = os.getenv('CHANNEL_SECRET', '').encode('utf-8')  # 用於簽名驗證
 
 # --- 永久儲存 MASTER USER 功能 ---
 MASTER_USER_FILE = "master_user_ids.json"
@@ -777,7 +785,7 @@ else:
 
 
 def _translate_with_deepl(text, target_lang):
-    """使用 DeepL API 翻譯，若語言不支援或錯誤則回傳 None。"""
+    """使用 DeepL API 翻譯，timeout 5秒，最多 retry 1次"""
 
     if not DEEPL_API_KEY:
         return None
@@ -795,8 +803,8 @@ def _translate_with_deepl(text, target_lang):
 
     url = f"{DEEPL_API_BASE_URL.rstrip('/')}/v2/translate"
     
-    # 增加 timeout 至 5 秒，並加上重試機制與 exponential backoff
-    max_retries = 3
+    # 降低 retry 為 1 次，避免卡死
+    max_retries = 2  # 1 次原始 + 1 次 retry
     for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(
@@ -812,7 +820,7 @@ def _translate_with_deepl(text, target_lang):
             print(f"❌ DeepL 請求錯誤 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.5 * attempt)  # exponential backoff: 0.5s, 1s, 1.5s
+            time.sleep(0.2)  # 快速 retry
             continue
 
         if resp.status_code != 200:
@@ -820,7 +828,7 @@ def _translate_with_deepl(text, target_lang):
             print(f"❌ DeepL 狀態碼 {resp.status_code} (第 {attempt} 次)，回應：{preview}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.5 * attempt)
+            time.sleep(0.2)
             continue
 
         try:
@@ -830,21 +838,21 @@ def _translate_with_deepl(text, target_lang):
                 print(f"❌ DeepL 回傳內容沒有 translations 欄位 (第 {attempt} 次)")
                 if attempt == max_retries:
                     return None
-                time.sleep(0.5 * attempt)
+                time.sleep(0.2)
                 continue
             return translations[0].get('text')
         except Exception as e:
             print(f"❌ 解析 DeepL 回應失敗 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.5 * attempt)
+            time.sleep(0.2)
             continue
     
     return None
 
 
 def _translate_with_google(text, target_lang):
-    """使用 Google Translate 非官方 API，加入 timeout 與錯誤處理。"""
+    """使用 Google Translate，timeout 3秒，最多 retry 1次"""
 
     url = "https://translate.googleapis.com/translate_a/single"
     params = {
@@ -854,8 +862,8 @@ def _translate_with_google(text, target_lang):
         'dt': 't',
         'q': text,
     }
-    # timeout 3 秒，最多重試 2 次
-    max_retries = 3  # 1 次原始請求 + 2 次重試
+    # 降低 retry 為 1 次，避免卡死
+    max_retries = 2  # 1 次原始 + 1 次 retry
     for attempt in range(1, max_retries + 1):
         try:
             res = requests.get(url, params=params, timeout=3)
@@ -863,7 +871,7 @@ def _translate_with_google(text, target_lang):
             print(f"❌ Google 翻譯請求錯誤 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.3)  # 重試前等待 0.3 秒
+            time.sleep(0.2)  # 快速 retry
             continue
 
         if res.status_code != 200:
@@ -871,7 +879,7 @@ def _translate_with_google(text, target_lang):
             print(f"❌ Google 翻譯狀態碼 {res.status_code} (第 {attempt} 次)，回應：{preview}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.3)
+            time.sleep(0.2)
             continue
 
         try:
@@ -880,25 +888,27 @@ def _translate_with_google(text, target_lang):
             print(f"❌ 解析 Google 翻譯回應失敗 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None
-            time.sleep(0.3)
+            time.sleep(0.2)
             continue
 
     return None
 
 
 def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
-    """統一翻譯入口：只使用一種引擎，不備援"""
+    """統一翻譯入口：預設 DeepL，失敗改用 Google（fallback 一次）"""
 
     # 如果是純數字、純符號或空白，直接返回原文
     if not text or text.strip().replace(' ', '').replace('.', '').replace(',', '').isdigit():
         return text
 
-    # 根據偏好選擇引擎
-    if prefer_deepl_first:
-        translated = _translate_with_deepl(text, target_lang)
-    else:
+    # 預設使用 DeepL，失敗則 fallback 到 Google
+    translated = _translate_with_deepl(text, target_lang)
+    
+    if translated is None:
+        # DeepL 失敗，嘗試 Google 一次
+        print(f"⚠️ DeepL 失敗，嘗試 Google fallback")
         translated = _translate_with_google(text, target_lang)
-
+    
     if translated is None:
         return "翻譯失敗QQ"
 
@@ -922,7 +932,18 @@ def _format_translation_results(text, langs, prefer_deepl_first=False, group_id=
 
 
 def _async_translate_and_reply(reply_token, text, langs, prefer_deepl_first=False, group_id=None):
-    """在背景執行緒中翻譯並用 reply_message 回覆，避免阻塞 webhook。"""
+    """在背景執行緒中翻譯並用 reply_message 回覆，避免阻塞 webhook。加入 semaphore 限制並發數"""
+
+    # 取得 semaphore，若無法取得則直接回傳忙碌訊息
+    acquired = translation_semaphore.acquire(blocking=False)
+    if not acquired:
+        print(f"⚠️ 翻譯執行緒已滿，拒絕新翻譯請求")
+        try:
+            line_bot_api.reply_message(reply_token,
+                                       TextSendMessage(text="⏳ 翻譯忙碌中，請稍後再試"))
+        except:
+            pass  # reply 失敗不重試
+        return
 
     try:
         # 為了避免 set 在其他地方被修改，先轉成 list
@@ -932,6 +953,9 @@ def _async_translate_and_reply(reply_token, text, langs, prefer_deepl_first=Fals
                                    TextSendMessage(text=result_text))
     except Exception as e:
         print(f"❌ 非同步翻譯回覆失敗: {type(e).__name__}: {e}")
+        # 失敗不重試，避免連鎖反應
+    finally:
+        translation_semaphore.release()  # 確保釋放 semaphore
 
 def reply(token, message_content):
     from linebot.models import FlexSendMessage
@@ -978,17 +1002,24 @@ def is_group_admin(user_id, group_id):
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    # 簽名驗證
-    signature = request.headers.get('X-Line-Signature')
+    # LINE Webhook 簽名驗證（不使用 handler.handle）
+    signature = request.headers.get('X-Line-Signature', '')
     body_text = request.get_data(as_text=True)
     
-    try:
-        handler.handle(body_text, signature)
-    except Exception as e:
-        print(f"❌ Webhook 簽名驗證失敗: {e}")
-        return 'Invalid signature', 400
+    # 手動驗證簽名
+    if CHANNEL_SECRET:
+        hash_obj = hmac.new(CHANNEL_SECRET, body_text.encode('utf-8'), hashlib.sha256)
+        expected_signature = base64.b64encode(hash_obj.digest()).decode('utf-8')
+        if signature != expected_signature:
+            print(f"❌ Webhook 簽名驗證失敗")
+            return 'Invalid signature', 400
     
-    body = request.get_json()
+    # 簽名驗證通過，手動解析 events
+    try:
+        body = json.loads(body_text)
+    except:
+        return 'Invalid JSON', 400
+    
     events = body.get("events", [])
     for event in events:
         source = event.get("source", {})
@@ -1495,7 +1526,12 @@ def monitor_memory():
 import psutil
 
 def keep_alive():
-    """每5分鐘檢查服務狀態"""
+    """每5分鐘檢查服務狀態 - Railway 環境下停用"""
+    # 在 Railway 環境下不啟用 keep_alive，避免自我請求造成資源浪費
+    if os.getenv('RAILWAY_ENVIRONMENT'):
+        print("🚆 偵測到 Railway 環境，停用 keep_alive")
+        return
+    
     retry_count = 0
     max_retries = 3
     restart_interval = 10800  # 每3小時重啟一次
@@ -1530,30 +1566,35 @@ def keep_alive():
         time.sleep(300)  # 5分鐘檢查一次
 
 if __name__ == '__main__':
-    max_retries = 3
-    retry_count = 0
+    # 檢查是否在 gunicorn 環境下運行
+    if 'gunicorn' in os.getenv('SERVER_SOFTWARE', ''):
+        print("🦄 偵測到 gunicorn 環境，不啟動 Flask 開發伺服器")
+        # gunicorn 會自動處理 app，不需要 app.run()
+    else:
+        max_retries = 3
+        retry_count = 0
 
-    while True:
-        try:
-            # 啟動自動檢查 20 天未使用群組的機制
-            start_inactive_checker()
+        while True:
+            try:
+                # 啟動自動檢查 20 天未使用群組的機制
+                start_inactive_checker()
 
-            # 啟動Keep-Alive線程
-            keep_alive_thread = threading.Thread(target=keep_alive,
-                                                 daemon=True)
-            keep_alive_thread.start()
-            print("✨ Keep-Alive機制已啟動")
+                # 啟動Keep-Alive線程（Railway 環境下會自動停用）
+                keep_alive_thread = threading.Thread(target=keep_alive,
+                                                     daemon=True)
+                keep_alive_thread.start()
+                print("✨ Keep-Alive機制已啟動")
 
-            # 運行Flask應用
-            app.run(host='0.0.0.0', port=5000)
-        except Exception as e:
-            retry_count += 1
-            print(f"❌ 發生錯誤 (重試 {retry_count}/{max_retries}): {str(e)}")
+                # 運行Flask應用
+                app.run(host='0.0.0.0', port=5000)
+            except Exception as e:
+                retry_count += 1
+                print(f"❌ 發生錯誤 (重試 {retry_count}/{max_retries}): {str(e)}")
 
-            if retry_count >= max_retries:
-                print("🔄 達到最大重試次數,完全重啟程序...")
-                os._exit(1)
+                if retry_count >= max_retries:
+                    print("🔄 達到最大重試次數,完全重啟程序...")
+                    os._exit(1)
 
-            print(f"🔄 5秒後重試...")
-            time.sleep(5)
-            continue
+                print(f"🔄 5秒後重試...")
+                time.sleep(5)
+                continue
