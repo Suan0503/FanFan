@@ -632,9 +632,24 @@ def add_group_to_tenant_db(user_id, group_id):
         db.session.commit()
         return True
 
+def _update_stats_async(group_id, char_count, engine):
+    """非阻塞方式更新統計"""
+    def _do_update():
+        try:
+            with app.app_context():
+                tenant = get_tenant_by_group_db(group_id)
+                if tenant:
+                    update_tenant_stats_db(tenant.user_id, translate_count=1, char_count=char_count, engine=engine)
+        except Exception as e:
+            print(f"⚠️ 背景更新統計失敗: {e}")
+    
+    # 在背景執行緒中更新，不阻塞翻譯
+    threading.Thread(target=_do_update, daemon=True).start()
+
+
 def update_tenant_stats_db(user_id, translate_count=0, char_count=0, engine='google'):
-    """更新租戶統計資料（資料庫版本）"""
-    with app.app_context():
+    """更新租戶統計資料（資料庫版本）- 必須在 app_context 中調用"""
+    try:
         tenant = Tenant.query.filter_by(user_id=user_id).first()
         if tenant:
             # 重置每日統計（如果需要）
@@ -652,6 +667,10 @@ def update_tenant_stats_db(user_id, translate_count=0, char_count=0, engine='goo
                 tenant.google_count += translate_count
             
             db.session.commit()
+            print(f"✅ 統計已更新: user={user_id[-8:]}, chars={char_count}, engine={engine}")
+    except Exception as e:
+        print(f"❌ 更新統計錯誤: {e}")
+        db.session.rollback()
 
 def check_group_access_db(group_id):
     """檢查群組是否有有效的租戶訂閱（資料庫版本）"""
@@ -986,24 +1005,31 @@ def _translate_with_google(text, target_lang):
 def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
     """統一翻譯入口：只使用一種引擎，不備援"""
 
-    # 根據偏好選擇引擎
-    engine = 'deepl' if prefer_deepl_first else 'google'
-    if prefer_deepl_first:
-        translated = _translate_with_deepl(text, target_lang)
-    else:
-        translated = _translate_with_google(text, target_lang)
+    try:
+        # 根據偏好選擇引擎
+        engine = 'deepl' if prefer_deepl_first else 'google'
+        if prefer_deepl_first:
+            translated = _translate_with_deepl(text, target_lang)
+        else:
+            translated = _translate_with_google(text, target_lang)
 
-    if translated is None:
+        if translated is None:
+            print(f"⚠️ 翻譯返回 None: target={target_lang}, engine={engine}")
+            return "翻譯失敗QQ"
+
+        # 更新 per-tenant 統計（非阻塞）
+        if group_id:
+            try:
+                _update_stats_async(group_id, len(text), engine)
+            except Exception as stats_err:
+                print(f"⚠️ 更新統計失敗（不影響翻譯）: {stats_err}")
+        
+        return translated
+    except Exception as e:
+        print(f"❌ 翻譯錯誤: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return "翻譯失敗QQ"
-
-    # 更新 per-tenant 統計（使用資料庫，包含引擎統計）
-    if group_id:
-        with app.app_context():
-            tenant = get_tenant_by_group_db(group_id)
-            if tenant:
-                update_tenant_stats_db(tenant.user_id, translate_count=1, char_count=len(text), engine=engine)
-    
-    return translated
 
 
 def _format_translation_results(text, langs, prefer_deepl_first=False, group_id=None):
@@ -1020,13 +1046,25 @@ def _async_translate_and_reply(reply_token, text, langs, prefer_deepl_first=Fals
     """在背景執行緒中翻譯並用 reply_message 回覆，避免阻塞 webhook。"""
 
     try:
+        print(f"🔄 開始翻譯: text_len={len(text)}, langs={langs}, group={group_id[-8:] if group_id else 'N/A'}")
+        
         # 為了避免 set 在其他地方被修改，先轉成 list
         lang_list = list(langs)
         result_text = _format_translation_results(text, lang_list, prefer_deepl_first=prefer_deepl_first, group_id=group_id)
+        
+        print(f"✅ 翻譯完成，準備回覆")
         line_bot_api.reply_message(reply_token,
                                    TextSendMessage(text=result_text))
+        print(f"✅ 回覆已發送")
     except Exception as e:
         print(f"❌ 非同步翻譯回覆失敗: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            line_bot_api.reply_message(reply_token,
+                                     TextSendMessage(text="翻譯失敗，請稍後再試"))
+        except:
+            pass
 
 def reply(token, message_content):
     from linebot.models import FlexSendMessage
@@ -1073,6 +1111,8 @@ def is_group_admin(user_id, group_id):
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
+    print(f"📥 收到 webhook 請求")
+    
     # 簽名驗證
     signature = request.headers.get('X-Line-Signature')
     body_text = request.get_data(as_text=True)
@@ -1083,20 +1123,25 @@ def webhook():
         print(f"❌ Webhook 簽名驗證失敗: {e}")
         return 'Invalid signature', 400
     
-    body = request.get_json()
-    events = body.get("events", [])
-    for event in events:
-        source = event.get("source", {})
-        group_id = source.get("groupId") or source.get("userId")
-        user_id = source.get("userId")
-        if not group_id or not user_id:
-            continue
-        event_type = event.get("type")
+    try:
+        body = request.get_json()
+        events = body.get("events", [])
+        print(f"📊 處理 {len(events)} 個事件")
+        
+        for event in events:
+            try:
+                source = event.get("source", {})
+                group_id = source.get("groupId") or source.get("userId")
+                user_id = source.get("userId")
+                if not group_id or not user_id:
+                    continue
+                event_type = event.get("type")
+                print(f"🔄 處理事件: type={event_type}, group={group_id[-8:] if group_id else 'N/A'}, user={user_id[-8:] if user_id else 'N/A'}")
 
-        # 若是群組事件，更新最後活躍時間
-        raw_group_id = source.get("groupId")
-        if raw_group_id:
-            touch_group_activity(raw_group_id)
+                # 若是群組事件，更新最後活躍時間
+                raw_group_id = source.get("groupId")
+                if raw_group_id:
+                    touch_group_activity(raw_group_id)
 
         # --- 機器人被加進群組時公告 + 自動跳出語言選單 ---
         if event_type == 'join':
@@ -2013,7 +2058,22 @@ ID：...{group_id[-8:]}
                               list(langs), prefer_deepl_first, group_id),
                         daemon=True).start()
                     continue
-    return 'OK'
+                    
+            except Exception as event_err:
+                print(f"❌ 處理事件時發生錯誤: {type(event_err).__name__}: {event_err}")
+                import traceback
+                traceback.print_exc()
+                # 繼續處理下一個事件
+                continue
+        
+        print(f"✅ 所有事件處理完成")
+        return 'OK'
+        
+    except Exception as e:
+        print(f"❌ Webhook 處理錯誤: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return 'Error', 500
 
 @app.route("/images/<path:filename>")
 def serve_image(filename):
