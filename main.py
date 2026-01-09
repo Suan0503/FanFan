@@ -560,13 +560,15 @@ def generate_tenant_token():
     import secrets
     return secrets.token_urlsafe(16)
 
-def create_tenant_db(user_id, months=1):
+def create_tenant_db(user_id, months=1, name=None):
     """創建租戶訂閱（資料庫版本）"""
     with app.app_context():
         token = generate_tenant_token()
         expires_at = datetime.utcnow() + timedelta(days=30 * months)
         
         tenant = Tenant.query.filter_by(user_id=user_id).first()
+        tenant_count = Tenant.query.count()
+        
         if tenant:
             # 更新現有租戶
             tenant.token = token
@@ -575,10 +577,16 @@ def create_tenant_db(user_id, months=1):
             tenant.plan = 'premium'
             tenant.reminded_7days = False
             tenant.reminded_1day = False
+            if name:
+                tenant.name = name
         else:
-            # 創建新租戶
+            # 創建新租戶，自動命名
+            if not name:
+                name = f"翻翻君{tenant_count + 1}"
+            
             tenant = Tenant(
                 user_id=user_id,
+                name=name,
                 token=token,
                 expires_at=expires_at,
                 plan='premium'
@@ -624,13 +632,25 @@ def add_group_to_tenant_db(user_id, group_id):
         db.session.commit()
         return True
 
-def update_tenant_stats_db(user_id, translate_count=0, char_count=0):
+def update_tenant_stats_db(user_id, translate_count=0, char_count=0, engine='google'):
     """更新租戶統計資料（資料庫版本）"""
     with app.app_context():
         tenant = Tenant.query.filter_by(user_id=user_id).first()
         if tenant:
+            # 重置每日統計（如果需要）
+            tenant.reset_daily_stats()
+            
+            # 更新統計
             tenant.translate_count += translate_count
             tenant.char_count += char_count
+            tenant.today_char_count += char_count
+            
+            # 更新引擎統計
+            if engine == 'deepl':
+                tenant.deepl_count += translate_count
+            else:
+                tenant.google_count += translate_count
+            
             db.session.commit()
 
 def check_group_access_db(group_id):
@@ -967,6 +987,7 @@ def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
     """統一翻譯入口：只使用一種引擎，不備援"""
 
     # 根據偏好選擇引擎
+    engine = 'deepl' if prefer_deepl_first else 'google'
     if prefer_deepl_first:
         translated = _translate_with_deepl(text, target_lang)
     else:
@@ -975,12 +996,12 @@ def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
     if translated is None:
         return "翻譯失敗QQ"
 
-    # 更新 per-tenant 統計（使用資料庫）
+    # 更新 per-tenant 統計（使用資料庫，包含引擎統計）
     if group_id:
         with app.app_context():
             tenant = get_tenant_by_group_db(group_id)
             if tenant:
-                update_tenant_stats_db(tenant.user_id, translate_count=1, char_count=len(text))
+                update_tenant_stats_db(tenant.user_id, translate_count=1, char_count=len(text), engine=engine)
     
     return translated
 
@@ -1086,6 +1107,35 @@ def webhook():
                 },
                 language_selection_message(group_id)
             ])
+            continue
+
+        # --- 處理成員離開群組事件 ---
+        if event_type == 'memberLeft':
+            left_members = event.get('left', {}).get('members', [])
+            for member in left_members:
+                left_user_id = member.get('userId')
+                
+                # 檢查離開的是否為租戶管理員
+                with app.app_context():
+                    group = Group.query.filter_by(group_id=group_id).first()
+                    if group and group.tenant:
+                        # 如果租戶本人或綁定人離開，機器人也離開
+                        if left_user_id == group.tenant.user_id or left_user_id == group.bound_by_user_id:
+                            try:
+                                # 先發送離開通知
+                                line_bot_api.push_message(
+                                    group_id,
+                                    TextSendMessage(text=f"👋 管理員已離開群組，翻譯機器人也將退出。\n如需繼續使用，請重新綁定。")
+                                )
+                                # 讓機器人離開群組
+                                line_bot_api.leave_group(group_id)
+                                
+                                # 更新資料庫狀態
+                                group.is_active = False
+                                db.session.commit()
+                                print(f"✅ 管理員 {left_user_id[-8:]} 離開，機器人已退出群組 {group_id[-8:]}")
+                            except Exception as e:
+                                print(f"❌ 機器人離開群組失敗: {e}")
             continue
 
         # --- 處理 postback 設定語言 ---
@@ -1260,26 +1310,83 @@ def webhook():
                         })
                         continue
                 
-                # 獲取所有租戶資訊
+                # 如果在群組中，顯示該群組的租戶詳細資訊
                 with app.app_context():
-                    all_tenants = Tenant.query.all()
-                    active_count = sum(1 for t in all_tenants if not t.is_expired())
-                    total_groups = Group.query.count()
+                    tenant = get_tenant_by_group_db(group_id) if group_id else None
                     
-                    tenant_list = []
-                    for tenant in all_tenants[:10]:  # 顯示前10個
-                        status = "✅" if not tenant.is_expired() else "❌"
-                        groups_count = len(tenant.groups)
-                        tenant_list.append(
-                            f"{status} {tenant.user_id[-8:]} | {tenant.plan.upper()} | "
-                            f"到期:{tenant.expires_at.strftime('%Y-%m-%d')} | "
-                            f"群組:{groups_count} | "
-                            f"翻譯:{tenant.translate_count}次"
-                        )
-                    
-                    tenant_text = "\n".join(tenant_list) if tenant_list else "無租戶資料"
-                    
-                    menu_text = f"""🎛️ 管理員控制面板
+                    if tenant:
+                        # ① 租戶基本資訊
+                        status = tenant.get_status()
+                        expires_str = tenant.expires_at.strftime('%Y-%m-%d')
+                        days_left = tenant.days_remaining()
+                        
+                        # ② 綁定的群組列表
+                        groups_info = []
+                        for g in tenant.groups:
+                            auto_status = "✅" if g.auto_translate else "❌"
+                            group_short_id = g.group_id[-8:] if len(g.group_id) > 8 else g.group_id
+                            bound_time = g.bound_at.strftime('%m/%d') if g.bound_at else '未知'
+                            groups_info.append(
+                                f"  • {g.group_name} (...{group_short_id})\n"
+                                f"    自動翻譯: {auto_status} | 綁定: {bound_time}"
+                            )
+                        groups_text = "\n".join(groups_info) if groups_info else "  無綁定群組"
+                        
+                        # ③ 用量摘要
+                        total_engine = tenant.google_count + tenant.deepl_count
+                        if total_engine > 0:
+                            google_pct = (tenant.google_count / total_engine) * 100
+                            deepl_pct = (tenant.deepl_count / total_engine) * 100
+                            engine_ratio = f"Google {google_pct:.1f}% / DeepL {deepl_pct:.1f}%"
+                        else:
+                            engine_ratio = "尚無使用記錄"
+                        
+                        menu_text = f"""🎛️ 租戶管理面板
+
+【租戶基本資訊】
+👤 名稱: {tenant.name}
+📊 狀態: {status}
+📅 到期日: {expires_str}
+⏰ 剩餘: {days_left} 天
+🏢 群組額度: {len(tenant.groups)}/{tenant.max_groups}
+
+【綁定的群組列表】
+{groups_text}
+
+【用量摘要（本期）】
+📝 本期已翻譯: {tenant.char_count:,} 字元
+📅 今日已翻譯: {tenant.today_char_count:,} 字元
+🔧 引擎比例: {engine_ratio}
+💬 翻譯次數: {tenant.translate_count:,} 次
+
+💡 管理指令
+/設定群組上限 @用戶 [數量] - 設定群組上限
+/租戶資訊 - 查看詳細資訊
+/統計 - 查看系統統計"""
+                        
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": menu_text
+                        })
+                    else:
+                        # 顯示所有租戶列表
+                        all_tenants = Tenant.query.all()
+                        active_count = sum(1 for t in all_tenants if not t.is_expired())
+                        total_groups = Group.query.count()
+                        
+                        tenant_list = []
+                        for tenant in all_tenants[:10]:  # 顯示前10個
+                            status = tenant.get_status()
+                            groups_count = len(tenant.groups)
+                            tenant_list.append(
+                                f"{status} {tenant.name} | "
+                                f"到期:{tenant.expires_at.strftime('%Y-%m-%d')} | "
+                                f"群組:{groups_count}/{tenant.max_groups}"
+                            )
+                        
+                        tenant_text = "\n".join(tenant_list) if tenant_list else "無租戶資料"
+                        
+                        menu_text = f"""🎛️ 管理員控制面板
 
 📊 系統統計
 👥 總租戶數: {len(all_tenants)}
@@ -1291,15 +1398,14 @@ def webhook():
 
 💡 管理指令
 /設定管理員 @用戶 [月數] - 新增租戶
+/設定群組上限 @用戶 [數量] - 設定上限
 /租戶資訊 - 查看當前群組租戶
-/統計 - 查看系統統計
-/白名單 add [user_id] - 加入白名單
-/白名單 list - 查看白名單"""
-                    
-                    reply(event['replyToken'], {
-                        "type": "text",
-                        "text": menu_text
-                    })
+/統計 - 查看系統統計"""
+                        
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": menu_text
+                        })
                 continue
 
             # --- 付費選單（付費用戶專用） ---
@@ -1380,6 +1486,266 @@ def webhook():
                     reply(event['replyToken'], {
                         "type": "text",
                         "text": f"📋 租戶資訊\n\n👤 User ID: {tenant.user_id[-8:]}\n🔑 TOKEN: {tenant.token[:12]}...\n📅 到期日: {tenant.expires_at.strftime('%Y-%m-%d')}\n⏰ 剩餘: {tenant.days_remaining()}天\n📊 狀態: {status}\n📦 方案: {tenant.plan.upper()}\n💬 翻譯次數: {tenant.translate_count}\n📝 字元數: {tenant.char_count}\n👥 管理群組數: {groups_count}"
+                    })
+                continue
+
+            # --- 設定群組上限（僅限主人）---
+            if lower.startswith('/設定群組上限') and user_id in MASTER_USER_IDS:
+                parts = text.replace('　', ' ').split()
+                if len(parts) >= 3:
+                    # 提取被 @ 的用戶和數量
+                    mentioned_users = []
+                    message = event.get('message', {})
+                    if 'mention' in message:
+                        mentions = message['mention'].get('mentionees', [])
+                        for mention in mentions:
+                            if mention.get('type') == 'user':
+                                mentioned_users.append(mention.get('userId'))
+                    
+                    if not mentioned_users:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 請使用 @ 標記要設定的用戶"
+                        })
+                        continue
+                    
+                    try:
+                        max_groups = int(parts[-1])
+                        if max_groups < 1 or max_groups > 999:
+                            raise ValueError
+                    except:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 群組數量必須是 1-999 之間的數字"
+                        })
+                        continue
+                    
+                    target_user_id = mentioned_users[0]
+                    with app.app_context():
+                        tenant = Tenant.query.filter_by(user_id=target_user_id).first()
+                        if tenant:
+                            tenant.max_groups = max_groups
+                            db.session.commit()
+                            reply(event['replyToken'], {
+                                "type": "text",
+                                "text": f"✅ 已設定群組上限！\n\n👤 用戶：{target_user_id[-8:]}\n🏢 群組上限：{max_groups} 個"
+                            })
+                        else:
+                            reply(event['replyToken'], {
+                                "type": "text",
+                                "text": "❌ 該用戶不是租戶，請先使用 /設定管理員 創建租戶"
+                            })
+                else:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 格式錯誤，請使用：`/設定群組上限 @用戶 [1-999]`"
+                    })
+                continue
+
+            # --- 移轉權限（付費用戶/主人可用）---
+            if lower.startswith('/移轉權限'):
+                # 檢查權限
+                with app.app_context():
+                    is_master = user_id in MASTER_USER_IDS
+                    tenant = Tenant.query.filter_by(user_id=user_id).first()
+                    
+                    if not is_master and (not tenant or tenant.is_expired()):
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 只有付費用戶或主人可以使用此功能"
+                        })
+                        continue
+                    
+                    parts = text.replace('　', ' ').split()
+                    if len(parts) < 2:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 格式錯誤，請使用：`/移轉權限 @用戶`"
+                        })
+                        continue
+                    
+                    # 提取被 @ 的用戶
+                    mentioned_users = []
+                    message = event.get('message', {})
+                    if 'mention' in message:
+                        mentions = message['mention'].get('mentionees', [])
+                        for mention in mentions:
+                            if mention.get('type') == 'user':
+                                mentioned_users.append(mention.get('userId'))
+                    
+                    if not mentioned_users:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 請使用 @ 標記要移轉給的用戶"
+                        })
+                        continue
+                    
+                    target_user_id = mentioned_users[0]
+                    
+                    # 儲存待確認的移轉資訊（簡單實作：使用 data 暫存）
+                    data.setdefault('pending_transfer', {})
+                    data['pending_transfer'][user_id] = {
+                        'target': target_user_id,
+                        'timestamp': datetime.utcnow().isoformat()
+                    }
+                    save_data()
+                    
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": f"⚠️ 確認移轉權限\n\n移轉給：{target_user_id[-8:]}\n\n移轉後您將無法使用付費功能，訂閱期限和群組都會轉移給對方。\n\n請輸入「是」確認移轉，或「否」取消"
+                    })
+                continue
+
+            # --- 處理移轉確認 ---
+            if text.strip() in ['是', '確認']:
+                pending = data.get('pending_transfer', {}).get(user_id)
+                if pending:
+                    with app.app_context():
+                        tenant = Tenant.query.filter_by(user_id=user_id).first()
+                        if tenant:
+                            target_user_id = pending['target']
+                            
+                            # 檢查目標用戶是否已是租戶
+                            target_tenant = Tenant.query.filter_by(user_id=target_user_id).first()
+                            if target_tenant:
+                                reply(event['replyToken'], {
+                                    "type": "text",
+                                    "text": "❌ 目標用戶已經是租戶，無法接收移轉"
+                                })
+                                del data['pending_transfer'][user_id]
+                                save_data()
+                                continue
+                            
+                            # 執行移轉：更改 user_id
+                            old_user_id = tenant.user_id
+                            tenant.user_id = target_user_id
+                            tenant.reminded_7days = False
+                            tenant.reminded_1day = False
+                            db.session.commit()
+                            
+                            # 清除待確認
+                            del data['pending_transfer'][user_id]
+                            save_data()
+                            
+                            reply(event['replyToken'], {
+                                "type": "text",
+                                "text": f"✅ 權限移轉成功！\n\n所有訂閱和群組已轉移給：{target_user_id[-8:]}\n您的付費功能已失效。"
+                            })
+                            
+                            # 通知新租戶（如果可以）
+                            try:
+                                line_bot_api.push_message(
+                                    target_user_id,
+                                    TextSendMessage(text=f"🎉 您已接收權限移轉！\n\n來自：{old_user_id[-8:]}\n訂閱到期日：{tenant.expires_at.strftime('%Y-%m-%d')}\n管理群組數：{len(tenant.groups)}\n\n請使用 /付費選單 查看詳情")
+                                )
+                            except:
+                                pass
+                        else:
+                            reply(event['replyToken'], {
+                                "type": "text",
+                                "text": "❌ 您不是租戶，無法移轉"
+                            })
+                            del data['pending_transfer'][user_id]
+                            save_data()
+                    continue
+
+            if text.strip() in ['否', '取消']:
+                if user_id in data.get('pending_transfer', {}):
+                    del data['pending_transfer'][user_id]
+                    save_data()
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "✅ 已取消移轉"
+                    })
+                    continue
+
+            # --- 綁定群組（付費用戶專用）---
+            if lower in ['/綁定群組', '/bind']:
+                if not group_id:
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": "❌ 此指令只能在群組中使用"
+                    })
+                    continue
+                
+                with app.app_context():
+                    tenant = Tenant.query.filter_by(user_id=user_id).first()
+                    
+                    # 檢查是否為付費用戶
+                    if not tenant or tenant.is_expired() or tenant.is_suspended:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 只有有效的付費用戶可以綁定群組\n\n請聯繫管理員開通或續費服務"
+                        })
+                        continue
+                    
+                    # 檢查是否超過上限
+                    if not tenant.can_add_group():
+                        current_groups = len(tenant.groups)
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": f"❌ 已超過綁定上限\n\n當前: {current_groups}/{tenant.max_groups}\n\n請退出舊群組或聯繫管理員擴充上限"
+                        })
+                        continue
+                    
+                    # 檢查群組是否已被其他租戶綁定
+                    existing_group = Group.query.filter_by(group_id=group_id).first()
+                    if existing_group and existing_group.tenant_id != tenant.id:
+                        reply(event['replyToken'], {
+                            "type": "text",
+                            "text": "❌ 此群組已被其他租戶綁定"
+                        })
+                        continue
+                    
+                    # 獲取群組資訊
+                    try:
+                        group_summary = line_bot_api.get_group_summary(group_id)
+                        group_name = group_summary.group_name
+                    except:
+                        group_name = "未知群組"
+                    
+                    # 創建或更新群組綁定
+                    if existing_group:
+                        existing_group.is_active = True
+                        existing_group.bound_by_user_id = user_id
+                        existing_group.bound_at = datetime.utcnow()
+                        existing_group.group_name = group_name
+                    else:
+                        new_group = Group(
+                            group_id=group_id,
+                            group_name=group_name,
+                            tenant_id=tenant.id,
+                            bound_by_user_id=user_id,
+                            auto_translate=True,
+                            voice_translation=True,
+                            engine_pref='google'
+                        )
+                        db.session.add(new_group)
+                    
+                    db.session.commit()
+                    
+                    # 顯示綁定成功訊息
+                    bind_msg = f"""✅ 綁定成功！
+
+📋 群組資訊
+名稱：{group_name}
+ID：...{group_id[-8:]}
+
+✓ 功能狀態（預設全開）
+✅ 自動翻譯
+✅ 語音翻譯
+✅ 多語言支援
+✅ 翻譯引擎切換
+
+📊 當前狀態：有效
+👤 綁定人：{user_id[-8:]}
+🏢 群組額度：{len(tenant.groups)}/{tenant.max_groups}
+
+💡 使用 /選單 設定翻譯語言"""
+                    
+                    reply(event['replyToken'], {
+                        "type": "text",
+                        "text": bind_msg
                     })
                 continue
 
