@@ -375,7 +375,8 @@ def get_engine_pref(group_id):
     engine = data.get("translate_engine_pref", {}).get(group_id)
     if engine in ("google", "deepl"):
         return engine
-    return "google"
+    return "deepl"  # 預設使用 DeepL
+
 
 
 def set_engine_pref(group_id, engine):
@@ -853,11 +854,11 @@ def _translate_with_google(text, target_lang):
         'dt': 't',
         'q': text,
     }
-    # timeout 2.5 秒，最多重試 1 次
-    max_retries = 2  # 1 次原始請求 + 1 次重試
+    # timeout 3 秒，最多重試 2 次
+    max_retries = 3  # 1 次原始請求 + 2 次重試
     for attempt in range(1, max_retries + 1):
         try:
-            res = requests.get(url, params=params, timeout=2.5)
+            res = requests.get(url, params=params, timeout=3)
         except requests.RequestException as e:
             print(f"❌ Google 翻譯請求錯誤 (第 {attempt} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
@@ -887,6 +888,10 @@ def _translate_with_google(text, target_lang):
 
 def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
     """統一翻譯入口：只使用一種引擎，不備援"""
+
+    # 如果是純數字、純符號或空白，直接返回原文
+    if not text or text.strip().replace(' ', '').replace('.', '').replace(',', '').isdigit():
+        return text
 
     # 根據偏好選擇引擎
     if prefer_deepl_first:
