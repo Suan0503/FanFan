@@ -325,10 +325,18 @@ def webhook():
             reply(event['replyToken'], [
                 {
                     "type": "text",
-                    "text": "👋 歡迎邀請翻譯小精靈！\n\n請按下「翻譯設定」選擇要翻譯的語言。"
+                    "text": "🎉 功能須知 🎉\n目前機器人的使用方式為免費使用\n使用方法如下：\n\n個人使用：\n加入好友➡️聊天室輸入 /選單 or /MENU 即可使用\n\n群組使用：\n建立群組➡️加入翻譯機器人➡️再聊天室輸入 /選單 or /MENU 即可使用"
                 },
                 language_selection_message(group_id)
             ])
+            continue
+        
+        # === 機器人被加入好友 ===
+        if event_type == 'follow':
+            reply(event['replyToken'], {
+                "type": "text",
+                "text": "🎉 功能須知 🎉\n目前機器人的使用方式為免費使用\n使用方法如下：\n\n個人使用：\n加入好友➡️聊天室輸入 /選單 or /MENU 即可使用\n\n群組使用：\n建立群組➡️加入翻譯機器人➡️再聊天室輸入 /選單 or /MENU 即可使用"
+            })
             continue
         
         # === Postback 事件（語言選擇） ===
