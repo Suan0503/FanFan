@@ -26,12 +26,12 @@ DEEPL_API_KEY = os.getenv('DEEPL_API_KEY', '')
 DEEPL_API_BASE_URL = os.getenv('DEEPL_API_BASE_URL', 'https://api-free.deepl.com')
 GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
-# Google 翻譯 timeout 設定 (connect_timeout, read_timeout)
-GOOGLE_TIMEOUT = (2, 4)
-# DeepL 翻譯 timeout 設定 (connect_timeout, read_timeout)
-DEEPL_TIMEOUT = (3, 8)
+# Google 翻譯 timeout 設定 (connect_timeout, read_timeout) [已優化]
+GOOGLE_TIMEOUT = (1.5, 3)
+# DeepL 翻譯 timeout 設定 (connect_timeout, read_timeout) [已優化]
+DEEPL_TIMEOUT = (2, 5)
 # 翻譯重試次數
-MAX_TRANSLATION_RETRIES = 2  # 1 次原始 + 1 次 retry
+MAX_TRANSLATION_RETRIES = 1  # 單次嘗試，快速失敗以支援 fallback
 
 # ============== 翻譯執行緒限制 ==============
 MAX_CONCURRENT_TRANSLATIONS = 4
@@ -68,6 +68,11 @@ DEFAULT_LANGUAGES = {'zh-TW'}
 INACTIVE_GROUP_DAYS = 20  # 超過多少天未使用的群組會自動退出
 KEEP_ALIVE_INTERVAL = 300  # Keep-alive 檢查間隔（秒）
 AUTO_RESTART_INTERVAL = 10800  # 自動重啟間隔（秒）
+
+# ============== 快取設定 ==============
+TRANSLATION_CACHE_TTL = 3600  # 翻譯結果快取時間 (秒)
+TRANSLATION_CACHE_SIZE = 1000  # 翻譯結果快取大小 (記錄數)
+GROUP_LANGS_CACHE_TTL = 300  # 群組語言設定快取時間 (秒)
 
 # ============== 日誌設定 ==============
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')

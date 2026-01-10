@@ -40,20 +40,20 @@ def translate(text, target_lang):
             print(f"⚠️ [Google] Timeout (第 {attempt}/{max_retries} 次): {e}")
             if attempt == max_retries:
                 return None, 'timeout'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
         except requests.RequestException as e:
             print(f"⚠️ [Google] 網路錯誤 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None, 'network_error'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
 
         # 處理 429 Too Many Requests
         if res.status_code == 429:
             print(f"⚠️ [Google] HTTP 429 Too Many Requests (第 {attempt}/{max_retries} 次)")
             if attempt < max_retries:
-                time.sleep(2)  # 429 需要較長等待
+                time.sleep(1)  # 優化：減少 429 等待時間
                 continue
             return None, 'rate_limited'
         
@@ -63,7 +63,7 @@ def translate(text, target_lang):
             print(f"⚠️ [Google] HTTP {res.status_code} (第 {attempt}/{max_retries} 次): {preview}")
             if attempt == max_retries:
                 return None, f'http_{res.status_code}'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
 
         # 解析回應
@@ -78,13 +78,13 @@ def translate(text, target_lang):
             print(f"⚠️ [Google] JSON 結構異常 (第 {attempt}/{max_retries} 次): {type(e).__name__}")
             if attempt == max_retries:
                 return None, 'parse_error'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
         except Exception as e:
             print(f"⚠️ [Google] JSON 解析失敗 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None, 'parse_error'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
 
     return None, 'unknown_error'

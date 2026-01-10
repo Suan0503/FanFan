@@ -48,6 +48,7 @@ from translations import deepl_translator
 
 # 導入工具
 from utils import file_utils, system_utils, line_utils
+from utils.cache import get_cache_stats
 
 # 導入 LINE Bot
 from linebot import LineBotApi, WebhookHandler
@@ -67,6 +68,10 @@ handler = WebhookHandler(config.CHANNEL_SECRET.decode('utf-8') if isinstance(con
 
 # 翻譯執行緒限制
 translation_semaphore = threading.Semaphore(config.MAX_CONCURRENT_TRANSLATIONS)
+
+# 選單快取
+menu_cache = {}  # group_id -> (menu_dict, timestamp)
+MENU_CACHE_TTL = 60  # 60 秒更新一次
 
 # 啟動時間
 start_time = time.time()
@@ -139,7 +144,17 @@ def save_data():
 
 # ============== 語言選單 ==============
 def language_selection_message(group_id):
-    """建立語言選擇選單"""
+    """
+    建立語言選擇選單（已優化：快取）
+    """
+    # 1️⃣ 檢查快取
+    if group_id in menu_cache:
+        cached_menu, cached_time = menu_cache[group_id]
+        if time.time() - cached_time < MENU_CACHE_TTL:
+            print(f"✅ [選單快取命中] {group_id}")
+            return cached_menu
+    
+    # 2️⃣ 生成選單
     current_langs = group_service.get_group_langs(group_id)
 
     contents = []
@@ -167,7 +182,7 @@ def language_selection_message(group_id):
         }
     })
 
-    return {
+    menu_msg = {
         "type": "flex",
         "altText": "🎊 新春翻譯設定",
         "contents": {
@@ -197,6 +212,10 @@ def language_selection_message(group_id):
             }
         }
     }
+    
+    # 3️⃣ 設定快取
+    menu_cache[group_id] = (menu_msg, time.time())
+    return menu_msg
 
 # ============== 非同步翻譯 ==============
 def _async_translate_and_reply(reply_token, text, langs, group_id=None):
@@ -221,27 +240,42 @@ def _async_translate_and_reply(reply_token, text, langs, group_id=None):
         translation_semaphore.release()
 
 # ============== Webhook 路由 ==============
+def verify_webhook_signature(signature, body_text):
+    """
+    驗證 LINE Webhook 簽名（前置驗證優化）
+    返回 (is_valid, events_dict)
+    """
+    if not config.CHANNEL_SECRET:
+        return False, None
+    
+    # 計算簽名
+    hash_obj = hmac.new(config.CHANNEL_SECRET, body_text.encode('utf-8'), hashlib.sha256)
+    expected_signature = base64.b64encode(hash_obj.digest()).decode('utf-8')
+    
+    if signature != expected_signature:
+        print(f"❌ Webhook 簽名驗證失敗")
+        return False, None
+    
+    # 簽名驗證成功，解析 JSON
+    try:
+        body = json.loads(body_text)
+        return True, body
+    except:
+        return False, None
+
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    """LINE Webhook 入口"""
-    # LINE Webhook 簽名驗證
+    """LINE Webhook 入口（已優化：前置簽名驗證）"""
+    # 1️⃣ 前置簽名驗證（不解析 JSON）
     signature = request.headers.get('X-Line-Signature', '')
     body_text = request.get_data(as_text=True)
     
-    # 手動驗證簽名
-    if config.CHANNEL_SECRET:
-        hash_obj = hmac.new(config.CHANNEL_SECRET, body_text.encode('utf-8'), hashlib.sha256)
-        expected_signature = base64.b64encode(hash_obj.digest()).decode('utf-8')
-        if signature != expected_signature:
-            print(f"❌ Webhook 簽名驗證失敗")
-            return 'Invalid signature', 400
+    is_valid, body = verify_webhook_signature(signature, body_text)
+    if not is_valid:
+        return 'Invalid signature', 400
     
-    # 解析 events
-    try:
-        body = json.loads(body_text)
-    except:
-        return 'Invalid JSON', 400
-    
+    # 2️⃣ 簽名驗證成功，處理事件
     events = body.get("events", [])
     for event in events:
         try:
@@ -301,6 +335,7 @@ def handle_postback(event, user_id, group_id):
     # 重設
     if data_post == 'reset':
         group_service._delete_group_langs_from_db(group_id)
+        menu_cache.pop(group_id, None)  # 清除快取
         line_utils.create_reply_message(line_bot_api, event['replyToken'],
                                        {"type": "text", "text": "✅ 已清除翻譯語言設定！"})
         return
@@ -314,6 +349,7 @@ def handle_postback(event, user_id, group_id):
         else:
             current_langs.add(code)
         group_service.set_group_langs(group_id, current_langs)
+        menu_cache.pop(group_id, None)  # 清除快取
         
         langs = [f"{label} ({code})" for label, code in config.LANGUAGE_MAP.items()
                  if code in group_service.get_group_langs(group_id)]
@@ -373,15 +409,20 @@ def home():
 
 @app.route("/status")
 def status():
-    """系統狀態檢查"""
+    """系統狀態端點（已優化：性能監控）"""
     uptime = time.time() - start_time
-    memory = system_utils.monitor_memory()
+    uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s"
+    
+    cache_stats = get_cache_stats()
+    
     return {
         "status": "ok",
+        "uptime": uptime_str,
         "uptime_seconds": int(uptime),
-        "memory_mb": memory,
-        "translation_queue": config.MAX_CONCURRENT_TRANSLATIONS
-    }
+        "memory_mb": system_utils.monitor_memory(),
+        "translation_queue": config.MAX_CONCURRENT_TRANSLATIONS,
+        "cache": cache_stats,
+    }, 200
 
 # ============== 主程式 ==============
 if __name__ == '__main__':

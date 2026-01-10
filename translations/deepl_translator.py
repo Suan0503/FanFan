@@ -85,20 +85,20 @@ def translate(text, target_lang):
             print(f"⚠️ [DeepL] Timeout (第 {attempt}/{max_retries} 次): {e}")
             if attempt == max_retries:
                 return None, 'timeout'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
         except requests.RequestException as e:
             print(f"⚠️ [DeepL] 網路錯誤 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None, 'network_error'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
 
         # 處理 429 Too Many Requests
         if resp.status_code == 429:
             print(f"⚠️ [DeepL] HTTP 429 Too Many Requests (第 {attempt}/{max_retries} 次)")
             if attempt < max_retries:
-                time.sleep(2)  # 429 需要較長等待
+                time.sleep(1)  # 優化：減少 429 等待時間
                 continue
             return None, 'rate_limited'
         
@@ -108,7 +108,7 @@ def translate(text, target_lang):
             print(f"⚠️ [DeepL] HTTP {resp.status_code} (第 {attempt}/{max_retries} 次): {preview}")
             if attempt == max_retries:
                 return None, f'http_{resp.status_code}'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
 
         # 解析回應
@@ -119,7 +119,7 @@ def translate(text, target_lang):
                 print(f"⚠️ [DeepL] 回應中無 translations 欄位 (第 {attempt}/{max_retries} 次)")
                 if attempt == max_retries:
                     return None, 'empty_response'
-                time.sleep(0.3)
+                time.sleep(0.1)  # 優化：減少重試等待時間
                 continue
             
             translated_text = translations[0].get('text')
@@ -133,7 +133,7 @@ def translate(text, target_lang):
             print(f"⚠️ [DeepL] JSON 解析失敗 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None, 'parse_error'
-            time.sleep(0.3)
+            time.sleep(0.1)  # 優化：減少重試等待時間
             continue
     
     return None, 'unknown_error'

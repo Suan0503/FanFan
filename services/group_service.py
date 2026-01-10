@@ -4,6 +4,11 @@ Group service - 群組設定管理服務
 from models import db, GroupTranslateSetting, GroupActivity, GroupEnginePreference
 from datetime import datetime, timedelta
 from utils.file_utils import load_json, save_json
+from utils.cache import (
+    get_group_langs_cache,
+    set_group_langs_cache,
+    invalidate_group_langs_cache,
+)
 import config
 
 
@@ -41,16 +46,33 @@ def _save_group_langs_to_db(group_id, langs):
         db.session.commit()
     except Exception:
         db.session.rollback()
+    
+    # 更新快取
+    invalidate_group_langs_cache(group_id)
 
 
 def get_group_langs(group_id):
-    """對外統一取得群組語言設定，優先使用資料庫，否則退回 data.json。"""
+    """
+    對外統一取得群組語言設定，優先使用快取，再用資料庫，最後退回 data.json。
+    （已優化：添加快取層）
+    """
+    # 1️⃣ 檢查快取
+    cached = get_group_langs_cache(group_id)
+    if cached is not None:
+        print(f"✅ [快取命中] 群組語言設定: {group_id}")
+        return cached
+    
+    # 2️⃣ 從 DB 取
     langs = _load_group_langs_from_db(group_id)
     if langs is not None:
+        set_group_langs_cache(group_id, langs)  # 設定快取
         return langs
     
+    # 3️⃣ 從 data.json 取
     data = load_json(config.DATA_FILE)
-    return data.get('user_prefs', {}).get(group_id, config.DEFAULT_LANGUAGES)
+    langs = data.get('user_prefs', {}).get(group_id, config.DEFAULT_LANGUAGES)
+    set_group_langs_cache(group_id, langs)  # 設定快取
+    return langs
 
 
 def set_group_langs(group_id, langs):
