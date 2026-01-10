@@ -34,11 +34,11 @@ def load_data():
                     "translate_engine_pref": loaded_data.get("translate_engine_pref", {}),
                     "tenants": loaded_data.get("tenants", {})
                 }
-                print("✅ 成功讀取資料！")
+                print("[Data] Successfully loaded data")
             except Exception as e:
-                print("❌ 讀取 data.json 出錯，使用預設資料")
+                print("[Data] Error reading data.json, using defaults")
     else:
-        print("🆕 沒找到資料，創建新的 data.json")
+        print("[Data] Data not found, creating new data.json")
         save_data(_data)
 
 
@@ -66,4 +66,4 @@ def save_data(data=None):
     }
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(save_data_dict, f, ensure_ascii=False, indent=2)
-        print("💾 資料已儲存！")
+        print("[Data] Data saved successfully")

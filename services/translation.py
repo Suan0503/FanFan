@@ -4,8 +4,9 @@ FanFan LINE Bot - 翻譯服務模組
 """
 import requests
 import time
+import threading
 from config import (
-    DEEPL_API_KEY, DEEPL_API_BASE_URL, DEFAULT_TRANSLATE_LANGS
+    DEEPL_API_KEY, DEEPL_API_BASE_URL, DEFAULT_TRANSLATE_LANGS, MAX_CONCURRENT_TRANSLATIONS
 )
 from utils import get_data, save_data
 from .tenant import get_tenant_by_group, update_tenant_stats
@@ -13,6 +14,9 @@ from .tenant import get_tenant_by_group, update_tenant_stats
 # 建立 requests.Session 重用連線，提升效能
 deepl_session = requests.Session()
 google_session = requests.Session()
+
+# 翻譯並發控制信號量
+translation_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
 
 # DeepL 支援的目標語言快取（啟動時載入）
 DEEPL_SUPPORTED_TARGETS = set()
@@ -23,7 +27,7 @@ def _load_deepl_supported_languages():
     global DEEPL_SUPPORTED_TARGETS
     
     if not DEEPL_API_KEY:
-        print("⚠️ 未設定 DEEPL_API_KEY，將只使用 Google 翻譯。")
+        print("Warning: DEEPL_API_KEY not set, will use Google Translate only.")
         return
     
     try:
@@ -38,13 +42,13 @@ def _load_deepl_supported_languages():
             languages = resp.json()
             # 提取語言代碼，DeepL 回傳格式如 [{"language": "EN", "name": "English"}, ...]
             DEEPL_SUPPORTED_TARGETS = {lang['language'].upper() for lang in languages}
-            print(f"✅ DeepL 已載入 {len(DEEPL_SUPPORTED_TARGETS)} 種支援語言: {sorted(DEEPL_SUPPORTED_TARGETS)}")
+            print(f"[DeepL] Loaded {len(DEEPL_SUPPORTED_TARGETS)} supported languages")
         else:
-            print(f"⚠️ 無法載入 DeepL 支援語言列表 (HTTP {resp.status_code})，將依語言代碼猜測")
+            print(f"[DeepL] Failed to load languages (HTTP {resp.status_code}), using fallback")
             # Fallback: 使用常見語言
             DEEPL_SUPPORTED_TARGETS = {'EN', 'JA', 'RU', 'ZH', 'ZH-HANT', 'ZH-HANS', 'DE', 'FR', 'ES', 'IT', 'PT', 'NL', 'PL', 'KO'}
     except Exception as e:
-        print(f"⚠️ 載入 DeepL 支援語言時發生錯誤: {type(e).__name__}: {e}")
+        print(f"[DeepL] Error loading languages: {type(e).__name__}: {e}")
         # Fallback: 使用常見語言
         DEEPL_SUPPORTED_TARGETS = {'EN', 'JA', 'RU', 'ZH', 'ZH-HANT', 'ZH-HANS', 'DE', 'FR', 'ES', 'IT', 'PT', 'NL', 'PL', 'KO'}
 
@@ -97,13 +101,13 @@ def _translate_with_deepl(text, target_lang):
                 timeout=(3, 8),  # (connect_timeout, read_timeout)
             )
         except requests.Timeout as e:
-            print(f"⚠️ [DeepL] Timeout (第 {attempt}/{max_retries} 次): {e}")
+            print(f"[DeepL] Timeout (attempt {attempt}/{max_retries}): {e}")
             if attempt == max_retries:
                 return None, 'timeout'
             time.sleep(0.3)
             continue
         except requests.RequestException as e:
-            print(f"⚠️ [DeepL] 網路錯誤 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
+            print(f"[DeepL] Network error (attempt {attempt}/{max_retries}): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None, 'network_error'
             time.sleep(0.3)
@@ -111,7 +115,7 @@ def _translate_with_deepl(text, target_lang):
 
         # 處理 429 Too Many Requests
         if resp.status_code == 429:
-            print(f"⚠️ [DeepL] HTTP 429 Too Many Requests (第 {attempt}/{max_retries} 次)")
+            print(f"[DeepL] HTTP 429 Rate limit (attempt {attempt}/{max_retries})")
             if attempt < max_retries:
                 time.sleep(2)  # 429 需要較長等待
                 continue
@@ -120,7 +124,7 @@ def _translate_with_deepl(text, target_lang):
         # 處理其他 HTTP 錯誤
         if resp.status_code != 200:
             preview = resp.text[:150] if hasattr(resp, 'text') else ''
-            print(f"⚠️ [DeepL] HTTP {resp.status_code} (第 {attempt}/{max_retries} 次): {preview}")
+            print(f"[DeepL] HTTP {resp.status_code} (attempt {attempt}/{max_retries}): {preview}")
             if attempt == max_retries:
                 return None, f'http_{resp.status_code}'
             time.sleep(0.3)
@@ -131,7 +135,7 @@ def _translate_with_deepl(text, target_lang):
             data_json = resp.json()
             translations = data_json.get('translations') or []
             if not translations:
-                print(f"⚠️ [DeepL] 回應中無 translations 欄位 (第 {attempt}/{max_retries} 次)")
+                print(f"[DeepL] No translations field in response (attempt {attempt}/{max_retries})")
                 if attempt == max_retries:
                     return None, 'empty_response'
                 time.sleep(0.3)
@@ -141,11 +145,11 @@ def _translate_with_deepl(text, target_lang):
             if translated_text:
                 return translated_text, 'success'
             else:
-                print(f"⚠️ [DeepL] translations[0] 中無 text 欄位")
+                print(f"[DeepL] No text field in translation response")
                 return None, 'invalid_response'
                 
         except Exception as e:
-            print(f"⚠️ [DeepL] JSON 解析失敗 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
+            print(f"[DeepL] JSON parse error (attempt {attempt}/{max_retries}): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None, 'parse_error'
             time.sleep(0.3)
@@ -175,13 +179,13 @@ def _translate_with_google(text, target_lang):
                 timeout=(2, 4)  # (connect_timeout, read_timeout)
             )
         except requests.Timeout as e:
-            print(f"⚠️ [Google] Timeout (第 {attempt}/{max_retries} 次): {e}")
+            print(f"[Google] Timeout (attempt {attempt}/{max_retries}): {e}")
             if attempt == max_retries:
                 return None, 'timeout'
             time.sleep(0.3)
             continue
         except requests.RequestException as e:
-            print(f"⚠️ [Google] 網路錯誤 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
+            print(f"[Google] Network error (attempt {attempt}/{max_retries}): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None, 'network_error'
             time.sleep(0.3)
@@ -189,7 +193,7 @@ def _translate_with_google(text, target_lang):
 
         # 處理 429 Too Many Requests
         if res.status_code == 429:
-            print(f"⚠️ [Google] HTTP 429 Too Many Requests (第 {attempt}/{max_retries} 次)")
+            print(f"[Google] HTTP 429 Rate limit (attempt {attempt}/{max_retries})")
             if attempt < max_retries:
                 time.sleep(2)  # 429 需要較長等待
                 continue
@@ -198,7 +202,7 @@ def _translate_with_google(text, target_lang):
         # 處理其他 HTTP 錯誤
         if res.status_code != 200:
             preview = res.text[:150] if hasattr(res, 'text') else ''
-            print(f"⚠️ [Google] HTTP {res.status_code} (第 {attempt}/{max_retries} 次): {preview}")
+            print(f"[Google] HTTP {res.status_code} (attempt {attempt}/{max_retries}): {preview}")
             if attempt == max_retries:
                 return None, f'http_{res.status_code}'
             time.sleep(0.3)
@@ -210,16 +214,16 @@ def _translate_with_google(text, target_lang):
             if result:
                 return result, 'success'
             else:
-                print(f"⚠️ [Google] 回應中無翻譯文字")
+                print(f"[Google] No translation text in response")
                 return None, 'empty_response'
         except (IndexError, KeyError, TypeError) as e:
-            print(f"⚠️ [Google] JSON 結構異常 (第 {attempt}/{max_retries} 次): {type(e).__name__}")
+            print(f"[Google] Unexpected JSON structure (attempt {attempt}/{max_retries}): {type(e).__name__}")
             if attempt == max_retries:
                 return None, 'parse_error'
             time.sleep(0.3)
             continue
         except Exception as e:
-            print(f"⚠️ [Google] JSON 解析失敗 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
+            print(f"[Google] JSON parse error (attempt {attempt}/{max_retries}): {type(e).__name__}: {e}")
             if attempt == max_retries:
                 return None, 'parse_error'
             time.sleep(0.3)
@@ -252,7 +256,7 @@ def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
         return translated
     
     # 2. Google 失敗，嘗試 DeepL fallback
-    print(f"⚠️ [翻譯] Google 失敗 ({google_reason})，嘗試 DeepL fallback，語言: {target_lang}")
+    print(f"[Translation] Google failed ({google_reason}), trying DeepL fallback for {target_lang}")
     translated, deepl_reason = _translate_with_deepl(text, target_lang)
     
     if translated:
@@ -265,10 +269,10 @@ def translate_text(text, target_lang, prefer_deepl_first=False, group_id=None):
     
     # 3. DeepL 也失敗，判斷原因
     if deepl_reason == 'unsupported_language':
-        print(f"ℹ️ [翻譯] DeepL 也不支援 {target_lang}")
+        print(f"[Translation] DeepL also does not support {target_lang}")
     
     # 4. Google 和 DeepL 都失敗
-    print(f"❌ [翻譯] Google ({google_reason}) 和 DeepL ({deepl_reason}) 都失敗，語言: {target_lang}")
+    print(f"[Translation] Both Google ({google_reason}) and DeepL ({deepl_reason}) failed for {target_lang}")
     return "翻譯暫時失敗，請稍後再試"
 
 

@@ -33,17 +33,15 @@ from linebot.models import TextSendMessage, FlexSendMessage
 
 # 導入配置和模組
 import config
-from utils import get_data, save_data, load_data, load_master_users, save_master_users, monitor_memory
-from services.translation import (
-    translate_text, _format_translation_results, _load_deepl_supported_languages, translation_semaphore
+from utils import get_data, save_data, load_data, load_master_users
+from services import (
+    translate_text, _format_translation_results, translation_semaphore,
+    _load_deepl_supported_languages, create_tenant, get_tenant_by_group,
+    is_tenant_valid, add_group_to_tenant, update_tenant_stats,
+    get_group_langs, set_group_langs, get_group_stats_for_status,
+    get_engine_pref, set_engine_pref, touch_group_activity, check_inactive_groups
 )
-from services.tenant import (
-    create_tenant, get_tenant_by_group, is_tenant_valid,
-    add_group_to_tenant
-)
-from services.group import get_group_langs, set_group_langs, get_group_stats_for_status
-from services.engine import get_engine_pref, set_engine_pref
-from services.activity import touch_group_activity, check_inactive_groups
+from handlers import handle_webhook_events
 
 # ============================================================================
 # Flask 應用初始化
@@ -109,13 +107,17 @@ else:
 # ============================================================================
 # 啟動初期化
 # ============================================================================
-load_data()
+try:
+    load_data()
+except Exception as e:
+    print(f"Warning: Failed to load data: {e}")
 
 if config.DEEPL_API_KEY:
-    print(f"✅ DEEPL_API_KEY 已載入（開頭: {config.DEEPL_API_KEY[:6]}...）")
-    _load_deepl_supported_languages()
-else:
-    print("⚠️ 未設定 DEEPL_API_KEY，將只使用 Google 翻譯。")
+    try:
+        _load_deepl_supported_languages()
+    except Exception as e:
+        print(f"Warning: Failed to load DeepL languages: {e}")
+
 
 
 # ============================================================================
@@ -157,10 +159,10 @@ def _async_translate_and_reply(reply_token, text, langs, prefer_deepl_first=Fals
     """背景執行緒翻譯並回覆"""
     acquired = translation_semaphore.acquire(blocking=False)
     if not acquired:
-        print(f"⚠️ 翻譯執行緒已滿，拒絕新翻譯請求")
+        print(f"[Translation] Thread pool exhausted, rejecting request")
         try:
             line_bot_api.reply_message(reply_token,
-                                       TextSendMessage(text="⏳ 翻譯忙碌中，請稍後再試"))
+                                       TextSendMessage(text="Translation service is busy, please try again later"))
         except:
             pass
         return
@@ -171,7 +173,7 @@ def _async_translate_and_reply(reply_token, text, langs, prefer_deepl_first=Fals
         line_bot_api.reply_message(reply_token,
                                    TextSendMessage(text=result_text))
     except Exception as e:
-        print(f"❌ 非同步翻譯回覆失敗: {type(e).__name__}: {e}")
+        print(f"[Translation] Async reply failed: {type(e).__name__}: {e}")
     finally:
         translation_semaphore.release()
 
@@ -292,7 +294,7 @@ def webhook():
         hash_obj = hmac.new(config.CHANNEL_SECRET, body_text.encode('utf-8'), hashlib.sha256)
         expected_signature = base64.b64encode(hash_obj.digest()).decode('utf-8')
         if signature != expected_signature:
-            print(f"❌ Webhook 簽名驗證失敗")
+            print(f"[Webhook] Signature verification failed")
             return 'Invalid signature', 400
     
     # 解析事件
@@ -416,7 +418,7 @@ def home():
 def keep_alive():
     """保活機制"""
     if os.getenv('RAILWAY_ENVIRONMENT'):
-        print("🚆 偵測到 Railway 環境，停用 keep_alive")
+        print("[System] Railway environment detected, disabling keep_alive")
         return
     
     retry_count = 0
@@ -428,22 +430,22 @@ def keep_alive():
             current_time = time.time()
             
             if current_time - last_restart >= config.RESTART_INTERVAL:
-                print("⏰ 執行定時重啟...")
+                print("[System] Executing scheduled restart...")
                 save_data()
                 os._exit(0)
 
             response = requests.get('http://0.0.0.0:5000/', timeout=10)
             if response.status_code == 200:
-                print("🔄 Keep-Alive 請求成功")
+                print("[System] Keep-Alive request successful")
                 retry_count = 0
             else:
-                raise Exception(f"狀態碼: {response.status_code}")
+                raise Exception(f"HTTP status code: {response.status_code}")
         except Exception as e:
             retry_count += 1
-            print(f"❌ Keep-Alive 失敗 (重試 {retry_count}/{max_retries})")
+            print(f"[System] Keep-Alive failed (retry {retry_count}/{max_retries})")
             
             if retry_count >= max_retries:
-                print("🔄 重啟伺服器...")
+                print("[System] Restarting server...")
                 os._exit(1)
             
             time.sleep(30)
@@ -457,7 +459,7 @@ def keep_alive():
 # ============================================================================
 if __name__ == '__main__':
     if 'gunicorn' in os.getenv('SERVER_SOFTWARE', ''):
-        print("🦄 偵測到 gunicorn 環境，不啟動 Flask 開發伺服器")
+        print("[System] Gunicorn detected, not starting Flask development server")
     else:
         max_retries = 3
         retry_count = 0
@@ -467,18 +469,18 @@ if __name__ == '__main__':
                 # 啟動保活執行緒
                 keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
                 keep_alive_thread.start()
-                print("✨ 系統已啟動")
+                print("[System] Application started")
 
                 # 運行 Flask
                 app.run(host='0.0.0.0', port=5000)
             except Exception as e:
                 retry_count += 1
-                print(f"❌ 發生錯誤 (重試 {retry_count}/{max_retries}): {str(e)}")
+                print(f"[System] Error occurred (retry {retry_count}/{max_retries}): {str(e)}")
 
                 if retry_count >= max_retries:
-                    print("🔄 達到最大重試次數，重啟程序...")
+                    print("[System] Max retries reached, restarting process...")
                     os._exit(1)
 
-                print(f"🔄 5 秒後重試...")
+                print(f"[System] Retrying in 5 seconds...")
                 time.sleep(5)
                 continue
