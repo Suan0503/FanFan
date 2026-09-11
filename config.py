@@ -31,7 +31,7 @@ GOOGLE_TIMEOUT = (1.5, 3)
 # DeepL 翻譯 timeout 設定 (connect_timeout, read_timeout) [已優化]
 DEEPL_TIMEOUT = (2, 5)
 # 翻譯重試次數
-MAX_TRANSLATION_RETRIES = 1  # 單次嘗試，快速失敗以支援 fallback
+MAX_TRANSLATION_RETRIES = 2  # 增加到2次以支援更好的速率限制恢復
 
 # ============== 翻譯執行緒限制 ==============
 MAX_CONCURRENT_TRANSLATIONS = 4

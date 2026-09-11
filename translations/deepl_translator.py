@@ -32,11 +32,11 @@ def load_deepl_supported_languages():
             print(f"✅ DeepL 已載入 {len(DEEPL_SUPPORTED_TARGETS)} 種支援語言: {sorted(DEEPL_SUPPORTED_TARGETS)}")
         else:
             print(f"⚠️ 無法載入 DeepL 支援語言列表 (HTTP {resp.status_code})，將依語言代碼猜測")
-            # Fallback: 使用常見語言
+            # Fallback: 使用常見語言 (僅包含 DeepL 實際支援的語言)
             DEEPL_SUPPORTED_TARGETS = {'EN', 'JA', 'RU', 'ZH', 'ZH-HANT', 'ZH-HANS', 'DE', 'FR', 'ES', 'IT', 'PT', 'NL', 'PL', 'KO'}
     except Exception as e:
         print(f"⚠️ 載入 DeepL 支援語言時發生錯誤: {type(e).__name__}: {e}")
-        # Fallback: 使用常見語言
+        # Fallback: 使用常見語言 (僅包含 DeepL 實際支援的語言)
         DEEPL_SUPPORTED_TARGETS = {'EN', 'JA', 'RU', 'ZH', 'ZH-HANT', 'ZH-HANS', 'DE', 'FR', 'ES', 'IT', 'PT', 'NL', 'PL', 'KO'}
 
 
@@ -54,12 +54,12 @@ def translate(text, target_lang):
     if not config.DEEPL_API_KEY:
         return None, 'no_api_key'
 
-    # 語言代碼轉換
+    # 語言代碼轉換 (僅包含 DeepL 實際支援的語言)
     lang_map = {
         'en': 'EN', 'ja': 'JA', 'ru': 'RU',
         'zh-TW': 'ZH-HANT', 'zh-CN': 'ZH-HANS',
         'de': 'DE', 'fr': 'FR', 'es': 'ES', 'it': 'IT', 'pt': 'PT',
-        'nl': 'NL', 'pl': 'PL', 'ko': 'KO', 'th': 'TH', 'vi': 'VI', 'id': 'ID', 'my': 'MY',
+        'nl': 'NL', 'pl': 'PL', 'ko': 'KO',
     }
     deepl_target = lang_map.get(target_lang, target_lang.upper())
     
@@ -74,8 +74,8 @@ def translate(text, target_lang):
         try:
             resp = deepl_session.post(
                 url,
+                headers={'Authorization': f'DeepL-Auth-Key {config.DEEPL_API_KEY}'},
                 data={
-                    'auth_key': config.DEEPL_API_KEY,
                     'text': text,
                     'target_lang': deepl_target,
                 },
@@ -98,7 +98,9 @@ def translate(text, target_lang):
         if resp.status_code == 429:
             print(f"⚠️ [DeepL] HTTP 429 Too Many Requests (第 {attempt}/{max_retries} 次)")
             if attempt < max_retries:
-                time.sleep(1)  # 優化：減少 429 等待時間
+                wait_time = min(2 ** attempt, 10)  # 指數退避：1秒, 2秒, 4秒...最多10秒
+                print(f"   等待 {wait_time} 秒後重試...")
+                time.sleep(wait_time)
                 continue
             return None, 'rate_limited'
         

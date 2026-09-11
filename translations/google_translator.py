@@ -53,7 +53,9 @@ def translate(text, target_lang):
         if res.status_code == 429:
             print(f"⚠️ [Google] HTTP 429 Too Many Requests (第 {attempt}/{max_retries} 次)")
             if attempt < max_retries:
-                time.sleep(1)  # 優化：減少 429 等待時間
+                wait_time = min(2 ** attempt, 10)  # 指數退避：1秒, 2秒, 4秒...最多10秒
+                print(f"   等待 {wait_time} 秒後重試...")
+                time.sleep(wait_time)
                 continue
             return None, 'rate_limited'
         
